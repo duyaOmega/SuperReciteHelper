@@ -8,6 +8,7 @@
 3. 记录错误次数到 error_record.json，支持断点续记
 4. 根据错误次数和错误率进行加权随机抽题
 """
+# Version 3.1.2
 
 import tkinter as tk
 from tkinter import messagebox, font as tkfont, filedialog, ttk
@@ -16,6 +17,7 @@ import json
 import os
 import random
 import math
+import ctypes
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
@@ -26,6 +28,14 @@ ANSWER_LABEL_RE = re.compile(r'^(?:正确答案|答案|参考答案|标准答案
 QUESTION_START_RE = re.compile(r'^\s*(?:\d{1,4}(?:[、．\)]|[.](?!\d))|[一二三四五六七八九十百零]+[.、．\)])\s*')
 OPTION_PREFIX_RE = re.compile(r'^\s*([A-HＡ-Ｈ])[.、．,，\)）:：]\s*')
 OPTION_TOKEN_RE = re.compile(r'([A-HＡ-Ｈ])[.、．,，\)）:：]\s*')
+
+# 宽松问答解析中，用于识别“无问号但明显是提问提示语”的行。
+QA_PROMPT_HINTS = (
+    '什么是', '哪些', '哪几', '哪一', '如何', '为什么', '为何', '是否',
+    '概念', '特点', '内容', '内涵', '作用', '意义', '影响', '要求',
+    '区别', '分类', '趋势', '原则', '方法', '地位', '历程', '阶段',
+    '名称', '含义', '实质', '时间', '对象', '标准', '功能', '战略',
+)
 
 
 def _normalize_extracted_text(text):
@@ -83,7 +93,7 @@ def _looks_like_answer_token(text):
 
 
 def _read_text_file(filepath):
-    for enc in ('utf-8-sig', 'utf-8', 'gb18030', 'gbk'):
+    for enc in ('utf-8-sig', 'utf-8', 'utf-16', 'utf-16-le', 'utf-16-be', 'gb18030', 'gbk'):
         try:
             with open(filepath, 'r', encoding=enc) as f:
                 return f.read()
@@ -134,6 +144,500 @@ def _extract_docx_text_with_style(filepath):
                     consume_para(para)
 
     return _normalize_extracted_text('\n'.join(lines).strip())
+
+
+def _docx_run_is_red(run):
+    """判断 docx run 是否为红色（兼容 RGB 与底层 XML 颜色值）。"""
+    try:
+        color = run.font.color if run.font else None
+        if color and color.rgb:
+            rgb = str(color.rgb).upper()
+            if rgb.startswith('FF') and rgb[2:4] in ('00', '11', '22', '33') and rgb[4:6] in ('00', '11', '22', '33'):
+                return True
+
+        color_el = run._element.find('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}color')
+        if color_el is not None:
+            val = (color_el.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val') or '').upper().strip('#')
+            if val in {'FF0000', 'C00000', 'CC0000', 'DD0000', 'EE0000'}:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _docx_run_is_nonblack(run):
+    """判断 run 是否为非黑色字体（含主题色/显式颜色）。"""
+
+    def is_near_black(rgb_hex):
+        if not rgb_hex or len(rgb_hex) != 6:
+            return False
+        try:
+            r = int(rgb_hex[0:2], 16)
+            g = int(rgb_hex[2:4], 16)
+            b = int(rgb_hex[4:6], 16)
+        except Exception:
+            return False
+
+        # 深灰正文（如 333333）不应被视作“强调色”。
+        return max(r, g, b) <= 70 and (max(r, g, b) - min(r, g, b)) <= 12
+
+    try:
+        color = run.font.color if run.font else None
+        if color is None:
+            return False
+
+        if color.rgb is not None:
+            rgb = str(color.rgb).upper()
+            rgb = rgb.replace('#', '')
+            if len(rgb) == 8:
+                rgb = rgb[-6:]
+            if rgb and rgb not in {'000000', '00000000'} and not is_near_black(rgb):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _docx_has_nondefault_shading(element):
+    """检测 XML 节点上的底纹/背景色是否为非默认值。"""
+    if element is None:
+        return False
+
+    try:
+        shd_nodes = element.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}shd')
+    except Exception:
+        shd_nodes = []
+
+    for shd in shd_nodes:
+        fill = (shd.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}fill') or '').upper()
+        color = (shd.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}color') or '').upper()
+        val = (shd.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val') or '').lower()
+
+        # 空值、auto、白色视作默认背景；其余颜色或样式视作有背景标记。
+        if fill and fill not in {'AUTO', 'FFFFFF', '00000000'}:
+            return True
+        if color and color not in {'AUTO', 'FFFFFF', '000000', '00000000'}:
+            return True
+        if val and val not in {'clear', 'nil'}:
+            return True
+
+    return False
+
+
+def _docx_run_is_emphasis(run):
+    """用于填空提取：下划线/加粗/非黑色/高亮均视为强调。"""
+    if _docx_run_is_nonblack(run):
+        return True
+    if bool(getattr(run, 'underline', False)):
+        return True
+    if bool(getattr(run, 'bold', False)):
+        return True
+    try:
+        if run.font and run.font.highlight_color is not None:
+            return True
+    except Exception:
+        pass
+
+    # 支持底层 XML 的背景色/底纹（某些文档把答案标在背景色而不是高亮里）。
+    try:
+        if _docx_has_nondefault_shading(run._element):
+            return True
+        parent = getattr(run._element, 'getparent', lambda: None)()
+        if parent is not None and _docx_has_nondefault_shading(parent):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _parse_docx_styled_blank_questions(filepath):
+    """从 docx 样式中提取填空题：强调样式文本视为答案片段。"""
+    try:
+        from docx import Document
+    except Exception:
+        return []
+
+    try:
+        doc = Document(filepath)
+    except Exception:
+        return []
+
+    def iter_paragraphs():
+        for p in doc.paragraphs:
+            yield p
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        yield p
+
+    questions = []
+    seen_texts = set()
+
+    for para in iter_paragraphs():
+        raw = para.text.strip()
+        if not raw:
+            continue
+        if _looks_like_option_line(raw):
+            continue
+
+        full_text = ''.join((r.text or '') for r in para.runs).strip()
+        if not full_text:
+            full_text = raw
+
+        if len(full_text) < 12 or len(full_text) > 260:
+            continue
+        if not any(ch in full_text for ch in ('，', '。', '；', ';', '：', ':', ',')):
+            continue
+        if _has_option_structure([full_text]):
+            continue
+
+        # 提取连续强调片段
+        segments = []
+        current = []
+        for run in para.runs:
+            t = (run.text or '')
+            if not t.strip():
+                continue
+            if _docx_run_is_emphasis(run):
+                current.append(t)
+            else:
+                if current:
+                    seg = ''.join(current).strip(' ，,。；;：:、()（）[]【】')
+                    if seg:
+                        segments.append(seg)
+                    current = []
+        if current:
+            seg = ''.join(current).strip(' ，,。；;：:、()（）[]【】')
+            if seg:
+                segments.append(seg)
+
+        # 去重并过滤噪声
+        cleaned_segments = []
+        seen_seg = set()
+        for seg in segments:
+            seg = re.sub(r'\s+', '', seg)
+            if not seg or seg in seen_seg:
+                continue
+            if len(seg) > 40:
+                continue
+            if re.fullmatch(r'[\W_]+', seg):
+                continue
+            if not re.search(r'[A-Za-z0-9\u4e00-\u9fff]', seg):
+                continue
+            seen_seg.add(seg)
+            cleaned_segments.append(seg)
+
+        if not cleaned_segments:
+            continue
+
+        # 过高强调占比多为整句加粗标题，不当作填空。
+        ratio = sum(len(s) for s in cleaned_segments) / max(len(full_text), 1)
+        if ratio < 0.03 or ratio > 0.55:
+            continue
+        if len(cleaned_segments) > 10:
+            continue
+
+        question_text = full_text
+        answers = []
+        replaced = False
+        for idx, seg in enumerate(cleaned_segments, 1):
+            placeholder = f'（{idx}）______'
+            if seg in question_text:
+                question_text = question_text.replace(seg, placeholder, 1)
+                answers.append(f'（{idx}）{seg}')
+                replaced = True
+
+        if not replaced:
+            continue
+
+        question_text = QUESTION_START_RE.sub('', question_text).strip()
+        if question_text in seen_texts:
+            continue
+        seen_texts.add(question_text)
+
+        questions.append({
+            'id': 0,
+            'text': question_text,
+            'options': {},
+            'answer': _clean_answer_text('；'.join(answers)),
+            'type': 'blank'
+        })
+
+    for idx, q in enumerate(questions, 1):
+        q['id'] = idx
+    return questions
+
+
+def _merge_docx_blank_questions(base_questions, blank_questions):
+    """将样式填空题并入解析结果，避免重复题干。"""
+    if not blank_questions:
+        return base_questions
+
+    def normalize_for_match(text):
+        t = (text or '')
+        t = re.sub(r'（\s*\d+\s*）\s*[_＿﹍]+', ' ', t)
+        t = re.sub(r'[_＿﹍]+', ' ', t)
+        t = re.sub(r'[\s，,。；;：:、（）()\[\]【】]+', '', t)
+        return t
+
+    blank_anchors = []
+    for b in blank_questions:
+        txt = b.get('text', '')
+        parts = re.split(r'（\s*\d+\s*）\s*[_＿﹍]+', txt)
+        anchors = [normalize_for_match(p) for p in parts if normalize_for_match(p)]
+        blank_anchors.append(anchors)
+
+    filtered_base = []
+    for q in base_questions:
+        if q.get('options'):
+            filtered_base.append(q)
+            continue
+
+        q_text_norm = normalize_for_match(q.get('text', ''))
+        should_drop = False
+        if q.get('type') in ('short', 'blank') and q_text_norm:
+            for anchors in blank_anchors:
+                if not anchors:
+                    continue
+                hit_count = sum(1 for a in anchors if len(a) >= 6 and a in q_text_norm)
+                long_hit = any(len(a) >= 12 and a in q_text_norm for a in anchors)
+                if long_hit or hit_count >= 2:
+                    should_drop = True
+                    break
+
+        if not should_drop:
+            filtered_base.append(q)
+
+    merged = list(filtered_base)
+    existing = set()
+    for q in merged:
+        t = re.sub(r'\s+', '', q.get('text', ''))
+        if t:
+            existing.add(t)
+
+    for b in blank_questions:
+        t = re.sub(r'\s+', '', b.get('text', ''))
+        if not t or t in existing:
+            continue
+        merged.append(dict(b))
+        existing.add(t)
+
+    for idx, q in enumerate(merged, 1):
+        q['id'] = idx
+    return merged
+
+
+def _mask_blank_question_text(question_text, answer_text):
+    """兜底：若填空题题干未挖空，则根据答案片段自动替换为空位。"""
+    text = (question_text or '').strip()
+    if not text:
+        return text
+    if _is_blank_question(text):
+        return text
+
+    ans = (answer_text or '').strip()
+    if not ans:
+        return text
+
+    # 优先匹配“（1）答案；（2）答案”格式。
+    pairs = re.findall(r'（\s*(\d+)\s*）\s*([^；;\n]+)', ans)
+    if pairs:
+        out = text
+        replaced = False
+        for idx, (_, seg) in enumerate(pairs, 1):
+            seg = seg.strip()
+            if seg and seg in out:
+                out = out.replace(seg, f'（{idx}）______', 1)
+                replaced = True
+        if replaced:
+            return out
+
+    # 次级策略：分号切分答案片段后替换。
+    chunks = [c.strip() for c in re.split(r'[；;]+', ans) if c.strip()]
+    out = text
+    replaced = 0
+    for i, chunk in enumerate(chunks, 1):
+        chunk = re.sub(r'^（\s*\d+\s*）', '', chunk).strip()
+        if chunk and chunk in out:
+            out = out.replace(chunk, f'（{i}）______', 1)
+            replaced += 1
+
+    return out if replaced > 0 else text
+
+
+def build_parse_candidates(filepath):
+    """构建题库解析候选结果，供预览时切换比对。"""
+    candidates = []
+    ext = os.path.splitext(filepath)[1].lower()
+
+    auto_questions = parse_questions(filepath)
+    candidates.append(('自动识别（推荐）', auto_questions, '综合策略自动选择并合并结果'))
+
+    if ext == '.docx':
+        red_questions = _parse_docx_questions_with_red(filepath)
+        if red_questions:
+            candidates.append(('仅红色选项识别', red_questions, '按红色字体识别客观题答案'))
+
+        styled_blanks = _parse_docx_styled_blank_questions(filepath)
+        if styled_blanks:
+            candidates.append(('仅样式填空识别', styled_blanks, '将下划线/非黑色/加粗视为填空答案'))
+
+        if red_questions and styled_blanks:
+            merged = _merge_docx_blank_questions(red_questions, styled_blanks)
+            candidates.append(('红色客观 + 样式填空', merged, '客观题用红色，填空题用样式提取'))
+
+    unique = []
+    seen = set()
+    for name, qs, desc in candidates:
+        signature = (len(qs), tuple(sorted((q.get('type', ''), len(q.get('options', {}))) for q in qs[:50])))
+        key = (name, signature)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((name, qs, desc))
+    return unique
+
+
+def _docx_extract_option_segments(para_text):
+    """从段落文本中提取选项段：(letter, start, end, option_text)。"""
+    segments = []
+    marker_re = re.compile(r'([A-HＡ-Ｈ])[.、．,，\)）:：]\s*')
+    markers = list(marker_re.finditer(para_text))
+    if not markers:
+        return segments
+
+    for i, m in enumerate(markers):
+        letter = m.group(1).translate(str.maketrans('ＡＢＣＤＥＦＧＨ', 'ABCDEFGH'))
+        start = m.start()
+        content_start = m.end()
+        content_end = markers[i + 1].start() if i + 1 < len(markers) else len(para_text)
+        option_text = para_text[content_start:content_end].strip().rstrip('。.，,；;')
+        segments.append((letter, start, content_end, option_text))
+    return segments
+
+
+def _parse_docx_questions_with_red(filepath):
+    """直接解析 docx：按红色选项识别正确答案，避免文本回退误判。"""
+    try:
+        from docx import Document
+    except Exception:
+        return []
+
+    try:
+        doc = Document(filepath)
+    except Exception:
+        return []
+
+    def iter_paragraphs():
+        for p in doc.paragraphs:
+            yield p
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        yield p
+
+    questions = []
+    current = None
+
+    def finalize_current():
+        nonlocal current
+        if not current:
+            return
+
+        question_text = current['text']
+        question_text = re.sub(r'^[\d]+[.、．\s]+', '', question_text)
+        question_text = re.sub(r'【[^】]*】\s*', '', question_text)
+        question_text = question_text.strip()
+
+        if not question_text or not current['options']:
+            current = None
+            return
+
+        red_answers = sorted(current['red_options'])
+        if not red_answers and current['explicit_answer']:
+            red_answers = _extract_choice_answer(current['explicit_answer'], current['options'])
+
+        if _is_judge_options(current['options']):
+            q_type = 'judge'
+        elif len(red_answers) > 1:
+            q_type = 'multi'
+        else:
+            q_type = 'single'
+
+        questions.append({
+            'id': 0,
+            'text': question_text,
+            'options': current['options'],
+            'answer': red_answers,
+            'type': q_type
+        })
+        current = None
+
+    for para in iter_paragraphs():
+        para_text = para.text.strip()
+        if not para_text:
+            continue
+
+        if QUESTION_START_RE.match(para_text):
+            finalize_current()
+            current = {
+                'text': para_text,
+                'options': {},
+                'red_options': set(),
+                'explicit_answer': ''
+            }
+            continue
+
+        if current is None:
+            continue
+
+        ans_match = ANSWER_LABEL_RE.match(para_text)
+        if ans_match:
+            current['explicit_answer'] = ans_match.group(1).strip()
+            continue
+
+        full_text = ''.join((r.text or '') for r in para.runs)
+        if not full_text.strip():
+            full_text = para_text
+
+        segments = _docx_extract_option_segments(full_text)
+        if not segments:
+            # 续行题干
+            if not current['options']:
+                current['text'] = (current['text'] + ' ' + para_text).strip()
+            continue
+
+        # 构建字符级红色掩码，按“选项段”判断哪一项为红色。
+        red_mask = []
+        for run in para.runs:
+            txt = run.text or ''
+            if not txt:
+                continue
+            red_mask.extend([_docx_run_is_red(run)] * len(txt))
+        if len(red_mask) < len(full_text):
+            red_mask.extend([False] * (len(full_text) - len(red_mask)))
+
+        for letter, start, end, option_text in segments:
+            if option_text:
+                current['options'][letter] = option_text
+
+            # 仅检测本选项的有效区间：去掉尾部空白，避免“下个选项前红色空格”误伤当前选项。
+            detect_end = end
+            while detect_end > start and full_text[detect_end - 1].isspace():
+                detect_end -= 1
+
+            # 该选项有效区间任一字符为红色，即视为正确选项。
+            if detect_end > start and any(red_mask[start:detect_end]):
+                current['red_options'].add(letter)
+
+    finalize_current()
+
+    for idx, q in enumerate(questions, 1):
+        q['id'] = idx
+    return questions
 
 
 def _extract_docx_text_fallback(filepath):
@@ -517,10 +1021,12 @@ def _extract_choice_answer(answer_text, options):
                 return [k]
 
     # 答案直接写了选项文本时，尝试反查
-    for k, v in options.items():
-        opt = v.strip()
-        if opt and (opt in answer_text or answer_text in opt):
-            return [k]
+    clean_answer = (answer_text or '').strip()
+    if clean_answer:
+        for k, v in options.items():
+            opt = v.strip()
+            if opt and (opt in clean_answer or clean_answer in opt):
+                return [k]
 
     return []
 
@@ -613,7 +1119,16 @@ def _parse_questions_loose_qa(text):
         return []
 
     def is_question_line(line):
-        return ('？' in line or '?' in line) and len(line) <= 160
+        if len(line) > 180:
+            return False
+        if '？' in line or '?' in line:
+            return True
+
+        # 一些资料用“概念：/特点：/内容：”而不写问号，也应当按提问行处理。
+        if line.endswith(('：', ':')):
+            if any(h in line for h in QA_PROMPT_HINTS):
+                return True
+        return False
 
     questions = []
     i = 0
@@ -636,6 +1151,10 @@ def _parse_questions_loose_qa(text):
         if not q_line:
             continue
 
+        # 无答案的问题行通常是目录/分节提示，过滤掉以降低噪声。
+        if not answer_text:
+            continue
+
         questions.append({
             'id': 0,
             'text': q_line,
@@ -649,8 +1168,71 @@ def _parse_questions_loose_qa(text):
 
     return questions
 
+
+def _parse_numbered_qa_blocks(text):
+    """解析“每题一行问题 + 后续多行答案”的编号简答题格式。"""
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    if not lines:
+        return []
+
+    blocks = []
+    current = []
+    for line in lines:
+        if QUESTION_START_RE.match(line):
+            if current:
+                blocks.append(current)
+            current = [line]
+        else:
+            if current:
+                current.append(line)
+    if current:
+        blocks.append(current)
+
+    questions = []
+    for block in blocks:
+        if len(block) < 2:
+            # 只有题干没有答案，不纳入可刷题集合。
+            continue
+
+        question_line = block[0]
+        if _has_option_structure(block):
+            continue
+
+        question_text = QUESTION_START_RE.sub('', question_line).strip()
+        answer_text = _clean_answer_text('\n'.join(block[1:]).strip())
+
+        if not question_text or not answer_text:
+            continue
+
+        questions.append({
+            'id': 0,
+            'text': question_text,
+            'options': {},
+            'answer': answer_text,
+            'type': 'blank' if _is_blank_question(question_text) else 'short'
+        })
+
+    for idx, q in enumerate(questions, 1):
+        q['id'] = idx
+    return questions
+
 def parse_questions(filepath):
     """解析题库文件，提取所有题目、选项、正确答案（支持 txt/pdf/doc/docx）。"""
+    ext = os.path.splitext(filepath)[1].lower()
+
+    # docx 优先尝试“红色选项直读”，避免回退文本解析误判答案。
+    if ext == '.docx':
+        red_docx_questions = _parse_docx_questions_with_red(filepath)
+        styled_blank_questions = _parse_docx_styled_blank_questions(filepath)
+        if red_docx_questions:
+            objective_with_answer = sum(
+                1 for q in red_docx_questions
+                if q.get('options') and q.get('answer')
+            )
+            # 当检测到足量客观题且有有效答案时，直接采用红字解析结果。
+            if len(red_docx_questions) >= 10 and objective_with_answer >= max(5, len(red_docx_questions) // 6):
+                return _merge_docx_blank_questions(red_docx_questions, styled_blank_questions)
+
     text = extract_text_by_filetype(filepath)
     text = _normalize_extracted_text(text)
 
@@ -688,12 +1270,35 @@ def parse_questions(filepath):
         if q:
             questions.append(q)
 
-    # 文档类文件零命中时，回退到宽松问答抽取（尤其针对 PDF/OCR 场景）。
-    ext = os.path.splitext(filepath)[1].lower()
-    if not questions and ext in ('.pdf', '.doc', '.docx'):
-        questions = _parse_questions_loose_qa(text)
+    # 低命中时回退到“编号简答”与“宽松问答”抽取，覆盖 txt/doc/docx/pdf 简答场景。
+    if ext in ('.txt', '.pdf', '.doc', '.docx'):
+        numbered_qa_questions = _parse_numbered_qa_blocks(text)
+        loose_questions = _parse_questions_loose_qa(text)
+        fallback_questions = numbered_qa_questions if len(numbered_qa_questions) >= len(loose_questions) else loose_questions
+
+        if not questions:
+            questions = fallback_questions
+        else:
+            # 若常规解析仅得到极少主观题，而宽松解析数量显著更多，
+            # 则判定发生了“整篇并题”，切换为宽松结果。
+            all_subjective = all(not q.get('options') for q in questions)
+            if all_subjective and len(questions) <= 3 and len(fallback_questions) >= len(questions) + 5:
+                questions = fallback_questions
+
+    if ext == '.docx':
+        styled_blank_questions = _parse_docx_styled_blank_questions(filepath)
+        blank_count = sum(1 for q in questions if q.get('type') == 'blank')
+        if styled_blank_questions and (blank_count == 0 or len(questions) <= 5):
+            questions = _merge_docx_blank_questions(questions, styled_blank_questions)
 
     # 重新编号
+    for q in questions:
+        if q.get('type') == 'short':
+            ans = str(q.get('answer', '') or '')
+            if re.search(r'（\s*\d+\s*）\s*[^；;\n]+', ans):
+                q['type'] = 'blank'
+                q['text'] = _mask_blank_question_text(q.get('text', ''), ans)
+
     for i, q in enumerate(questions):
         q['id'] = i + 1
 
@@ -919,21 +1524,50 @@ class QuizApp:
         self.answer_revealed = False
         self.option_buttons = {}
         self.judge_buttons = []
+        self.keyboard_var = tk.StringVar()
 
         self.root.title("刷题工具")
-        self.root.geometry("900x700")
+        self.ui_scale = self._get_ui_scale()
+        self._apply_adaptive_window_geometry()
         self.root.configure(bg='#f5f5f5')
-        self.root.minsize(700, 550)
+        min_w = max(760, int(self.window_width * 0.72))
+        min_h = max(560, int(self.window_height * 0.72))
+        self.root.minsize(min_w, min_h)
 
         # 字体
-        self.title_font = tkfont.Font(family='Microsoft YaHei', size=14, weight='bold')
-        self.text_font = tkfont.Font(family='Microsoft YaHei', size=12)
-        self.option_font = tkfont.Font(family='Microsoft YaHei', size=11)
-        self.small_font = tkfont.Font(family='Microsoft YaHei', size=10)
-        self.btn_font = tkfont.Font(family='Microsoft YaHei', size=11, weight='bold')
+        self.title_font = tkfont.Font(family='Microsoft YaHei', size=self._scale_font(16), weight='bold')
+        self.text_font = tkfont.Font(family='Microsoft YaHei', size=self._scale_font(13))
+        self.option_font = tkfont.Font(family='Microsoft YaHei', size=self._scale_font(12))
+        self.small_font = tkfont.Font(family='Microsoft YaHei', size=self._scale_font(10))
+        self.btn_font = tkfont.Font(family='Microsoft YaHei', size=self._scale_font(11), weight='bold')
+
+        self.question_wrap = max(680, int(self.window_width * 0.84))
 
         self.build_ui()
+        self.root.bind('<Return>', self._on_global_enter)
+        self.root.after(120, self._refresh_layout)
         self.show_welcome()
+
+    def _get_ui_scale(self):
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        scale_w = screen_w / 1920
+        scale_h = screen_h / 1080
+        return max(1.0, min(1.5, (scale_w + scale_h) / 2))
+
+    def _scale_font(self, base_size):
+        return max(10, int(round(base_size * self.ui_scale)))
+
+    def _apply_adaptive_window_geometry(self):
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+
+        self.window_width = max(920, min(1600, int(screen_w * 0.78)))
+        self.window_height = max(720, min(1100, int(screen_h * 0.84)))
+
+        x = max(0, (screen_w - self.window_width) // 2)
+        y = max(0, (screen_h - self.window_height) // 2)
+        self.root.geometry(f"{self.window_width}x{self.window_height}+{x}+{y}")
 
     def build_ui(self):
         # 顶部信息栏
@@ -998,7 +1632,7 @@ class QuizApp:
         self.q_text_label = tk.Label(
             self.scrollable_frame, text="", font=self.text_font,
             fg='#2c3e50', bg='#ffffff', anchor='w', justify='left',
-            wraplength=750, padx=15, pady=15, relief='ridge', bd=1
+            wraplength=self.question_wrap, padx=15, pady=15, relief='ridge', bd=1
         )
         self.q_text_label.pack(fill='x', pady=(0, 15))
 
@@ -1010,7 +1644,7 @@ class QuizApp:
         self.result_label = tk.Label(
             self.scrollable_frame, text="", font=self.text_font,
             fg='#27ae60', bg='#f5f5f5', anchor='w', justify='left',
-            wraplength=750
+            wraplength=self.question_wrap
         )
         self.result_label.pack(fill='x', pady=10)
 
@@ -1040,6 +1674,29 @@ class QuizApp:
         )
         self.next_btn.pack(side='left', padx=5, pady=10)
 
+        # 键盘输入区：支持 ABC 选项输入与 t/f 主观自评。
+        input_frame = tk.Frame(btn_frame, bg='#ecf0f1')
+        input_frame.pack(side='left', padx=(12, 0), pady=10)
+
+        self.keyboard_hint_label = tk.Label(
+            input_frame,
+            text='键盘输入：A/B/C 或 ABC；主观题用 t/f',
+            font=self.small_font,
+            fg='#34495e',
+            bg='#ecf0f1'
+        )
+        self.keyboard_hint_label.pack(side='left', padx=(0, 8))
+
+        self.keyboard_entry = tk.Entry(
+            input_frame,
+            textvariable=self.keyboard_var,
+            font=self.option_font,
+            width=16,
+            relief='groove'
+        )
+        self.keyboard_entry.pack(side='left', padx=(0, 6))
+        self.keyboard_entry.bind('<Return>', self._on_entry_enter)
+
         self.reset_btn = tk.Button(
             btn_frame, text="重置记录", font=self.small_font,
             bg='#e74c3c', fg='white', activebackground='#c0392b',
@@ -1049,6 +1706,20 @@ class QuizApp:
 
     def _on_canvas_configure(self, event):
         self.canvas.itemconfig(self.canvas_window, width=event.width)
+        self._refresh_layout()
+
+    def _refresh_layout(self):
+        canvas_w = self.canvas.winfo_width()
+        if canvas_w <= 1:
+            canvas_w = max(600, self.root.winfo_width() - 90)
+
+        content_width = max(420, canvas_w - 45)
+        self.q_text_label.config(wraplength=content_width)
+        self.result_label.config(wraplength=content_width)
+
+        option_wrap = max(380, content_width - 36)
+        for btn in self.option_buttons.values():
+            btn.config(wraplength=option_wrap)
 
     def _on_mousewheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -1070,6 +1741,8 @@ class QuizApp:
         )
         self.result_label.config(text="")
         self.history_label.config(text="")
+        self.keyboard_var.set('')
+        self.keyboard_hint_label.config(text='键盘输入：A/B/C 或 ABC；主观题用 t/f')
         self.submit_btn.config(state='disabled')
         self.update_stats()
 
@@ -1087,6 +1760,7 @@ class QuizApp:
         self.submitted = False
         self.answer_revealed = False
         self.selected = set()
+        self.keyboard_var.set('')
         self.current_q = weighted_random_pick(self.questions, self.records)
         self.display_question()
 
@@ -1102,7 +1776,10 @@ class QuizApp:
 
         self.q_number_label.config(text=f"第 {q['id']} 题")
         self.q_type_label.config(text=type_map.get(q['type'], ''))
-        self.q_text_label.config(text=q['text'])
+        display_text = q['text']
+        if q.get('type') == 'blank':
+            display_text = _mask_blank_question_text(q['text'], q.get('answer', ''))
+        self.q_text_label.config(text=display_text)
         self.result_label.config(text="")
 
         # 显示历史记录
@@ -1141,6 +1818,10 @@ class QuizApp:
                 self.option_buttons[key] = btn
 
             self.submit_btn.config(text='提交答案', state='normal')
+            if q['type'] == 'multi':
+                self.keyboard_hint_label.config(text='键盘输入：如 ABC；回车提交，已判分后回车下一题')
+            else:
+                self.keyboard_hint_label.config(text='键盘输入：如 A 或 B；回车提交，已判分后回车下一题')
         else:
             # 主观题：先不显示任何作答选项，先看答案再自判
             self.result_label.config(
@@ -1148,6 +1829,10 @@ class QuizApp:
                 fg='#7f8c8d'
             )
             self.submit_btn.config(text='显示正确答案', state='normal')
+            self.keyboard_hint_label.config(text='主观题：先回车显示答案，再输入 t/f 回车自评；再回车下一题')
+
+        self._refresh_layout()
+        self.keyboard_entry.focus_set()
 
         # 滚动到顶部
         self.canvas.yview_moveto(0)
@@ -1214,6 +1899,7 @@ class QuizApp:
 
             self.judge_buttons = [correct_btn, wrong_btn]
             self.submit_btn.config(state='disabled')
+            self.keyboard_hint_label.config(text='输入 t(对)/f(错) 后回车自评，已记录后回车下一题')
             return
 
         if not self.selected:
@@ -1259,6 +1945,7 @@ class QuizApp:
         )
 
         self.submit_btn.config(state='disabled')
+        self.keyboard_hint_label.config(text='已判分，按回车进入下一题')
 
     def submit_subjective_result(self, is_correct):
         if self.submitted:
@@ -1291,6 +1978,7 @@ class QuizApp:
         )
 
         self.submit_btn.config(state='disabled')
+        self.keyboard_hint_label.config(text='已记录，按回车进入下一题')
 
     def reset_records(self):
         if messagebox.askyesno("确认", "确定要重置所有错误记录吗？\n此操作不可撤销！"):
@@ -1299,10 +1987,102 @@ class QuizApp:
             self.update_stats()
             messagebox.showinfo("完成", "所有记录已重置。")
 
+    def _normalize_keyboard_text(self, text):
+        normalized = (text or '').strip().upper()
+        return normalized.translate(str.maketrans('ＡＢＣＤＥＦＧＨ，。、；：　', 'ABCDEFGH,,,,  '))
+
+    def _select_objective_by_keyboard(self, token):
+        if not self.current_q or self.submitted:
+            return False
+
+        q = self.current_q
+        if q['type'] not in ('single', 'multi', 'judge'):
+            return False
+
+        valid_keys = sorted(q['options'].keys())
+        letters = [ch for ch in token if ch in valid_keys]
+        if not letters:
+            return False
+
+        if q['type'] in ('single', 'judge'):
+            self.selected = {letters[-1]}
+        else:
+            self.selected = set(letters)
+
+        for k, btn in self.option_buttons.items():
+            if k in self.selected:
+                btn.config(bg='#3498db', fg='white')
+            else:
+                btn.config(bg='white', fg='#2c3e50')
+        return True
+
+    def _submit_subjective_by_keyboard(self, token):
+        if not self.current_q or self.submitted:
+            return False
+
+        q = self.current_q
+        if q['type'] not in ('blank', 'short'):
+            return False
+
+        if not self.answer_revealed:
+            return False
+
+        true_tokens = {'T', 'TRUE', 'Y', 'YES', '对', '正确'}
+        false_tokens = {'F', 'FALSE', 'N', 'NO', '错', '错误'}
+        if token in true_tokens:
+            self.submit_subjective_result(True)
+            return True
+        if token in false_tokens:
+            self.submit_subjective_result(False)
+            return True
+        return False
+
+    def _process_keyboard_enter(self):
+        if self.current_q is None:
+            self.next_question()
+            return
+
+        token = self._normalize_keyboard_text(self.keyboard_var.get())
+        self.keyboard_var.set('')
+
+        if token:
+            q_type = self.current_q['type']
+            if q_type in ('single', 'multi', 'judge'):
+                if not self._select_objective_by_keyboard(token):
+                    self.result_label.config(text='未识别到有效选项，请输入题目存在的字母（如 A/ABC）。', fg='#e67e22')
+                    return
+                if not self.submitted:
+                    self.submit_answer()
+                return
+
+            if q_type in ('blank', 'short'):
+                if self._submit_subjective_by_keyboard(token):
+                    return
+                self.result_label.config(text='主观题请输入 t/f 后回车（t=答对，f=答错）。', fg='#e67e22')
+                return
+
+        # 无输入时：未提交则提交/显示答案；已提交则下一题。
+        if not self.submitted:
+            self.submit_answer()
+        else:
+            self.next_question()
+
+    def _on_entry_enter(self, _event=None):
+        self._process_keyboard_enter()
+        return 'break'
+
+    def _on_global_enter(self, event=None):
+        widget = self.root.focus_get()
+        if widget is self.keyboard_entry:
+            return
+        self._process_keyboard_enter()
+
 
 # ============ 主程序 ============
 
 def main():
+    _enable_windows_high_dpi()
+
     # 确定脚本目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -1332,13 +2112,19 @@ def main():
 
     print(f"正在解析题库：{txt_path}")
     try:
-        questions = parse_questions(txt_path)
+        candidates = build_parse_candidates(txt_path)
     except Exception as e:
         messagebox.showerror('解析失败', f'文件解析失败：\n{e}')
         return
-    print(f"成功解析 {len(questions)} 道题目。")
 
-    if not questions:
+    if not candidates:
+        messagebox.showerror('错误', '未能解析出任何题目，请检查题库格式。')
+        return
+
+    default_questions = candidates[0][1]
+    print(f"成功解析 {len(default_questions)} 道题目（默认方案）。")
+
+    if not default_questions:
         messagebox.showerror('错误', '未能解析出任何题目，请检查题库格式。')
         return
 
@@ -1349,23 +2135,30 @@ def main():
     root.focus_force()
 
     # 导入预览窗口：先确认解析结果再进入刷题
-    if not show_import_preview(root, questions, txt_path):
+    selected_questions = show_import_preview(root, candidates, txt_path)
+    if not selected_questions:
         root.destroy()
         return
 
     # 切换工作目录到脚本目录（使 error_record.json 保存在同一位置）
     os.chdir(script_dir)
 
-    app = QuizApp(root, questions, source_path=txt_path)
+    app = QuizApp(root, selected_questions, source_path=txt_path)
     root.mainloop()
 
 
-def show_import_preview(root, questions, source_path):
+def show_import_preview(root, candidates, source_path):
     """展示解析预览，用户确认后开始刷题。"""
     win = tk.Toplevel(root)
     win.title('题库导入预览')
-    win.geometry('980x640')
-    win.minsize(850, 520)
+    screen_w = root.winfo_screenwidth()
+    screen_h = root.winfo_screenheight()
+    win_w = max(900, min(1700, int(screen_w * 0.82)))
+    win_h = max(580, min(1100, int(screen_h * 0.8)))
+    x = max(0, (screen_w - win_w) // 2)
+    y = max(0, (screen_h - win_h) // 2)
+    win.geometry(f'{win_w}x{win_h}+{x}+{y}')
+    win.minsize(max(850, int(win_w * 0.75)), max(520, int(win_h * 0.72)))
     win.configure(bg='#f5f5f5')
     win.transient(root)
     win.grab_set()
@@ -1374,21 +2167,11 @@ def show_import_preview(root, questions, source_path):
     top.pack(fill='x')
     top.pack_propagate(False)
 
-    type_count = {'single': 0, 'multi': 0, 'judge': 0, 'blank': 0, 'short': 0}
-    for q in questions:
-        t = q.get('type')
-        if t in type_count:
-            type_count[t] += 1
-
-    summary = (
-        f"文件：{os.path.basename(source_path)}  |  共 {len(questions)} 题"
-        f"  |  单选 {type_count['single']}  多选 {type_count['multi']}  判断 {type_count['judge']}"
-        f"  填空 {type_count['blank']}  简答 {type_count['short']}"
-    )
-    tk.Label(
-        top, text=summary, fg='white', bg='#2c3e50',
+    top_label = tk.Label(
+        top, text='', fg='white', bg='#2c3e50',
         font=('Microsoft YaHei', 10), anchor='w'
-    ).pack(fill='x', padx=12, pady=14)
+    )
+    top_label.pack(fill='x', padx=12, pady=14)
 
     body = tk.Frame(win, bg='#f5f5f5')
     body.pack(fill='both', expand=True, padx=12, pady=10)
@@ -1412,26 +2195,85 @@ def show_import_preview(root, questions, source_path):
         'short': '简答'
     }
 
-    for q in questions:
-        if isinstance(q.get('answer'), list):
-            answer_preview = ''.join(q['answer'])
-        else:
-            answer_preview = str(q.get('answer', ''))
-        if not answer_preview.strip():
-            answer_preview = '（未识别）'
-        answer_preview = answer_preview.replace('\n', ' / ').strip()
-        text_preview = str(q.get('text', '')).replace('\n', ' ').strip()
-        if len(text_preview) > 80:
-            text_preview = text_preview[:80] + '...'
-        if len(answer_preview) > 32:
-            answer_preview = answer_preview[:32] + '...'
+    selected_idx = tk.IntVar(value=0)
 
-        tree.insert('', 'end', values=(
-            q.get('id', ''),
-            type_name.get(q.get('type'), q.get('type', '')),
-            answer_preview,
-            text_preview
-        ))
+    strategy_frame = tk.Frame(win, bg='#f5f5f5')
+    strategy_frame.pack(fill='x', padx=12, pady=(0, 8))
+
+    tk.Label(
+        strategy_frame,
+        text='识别方案：',
+        bg='#f5f5f5', fg='#2c3e50', font=('Microsoft YaHei', 10)
+    ).pack(side='left')
+
+    strategy_names = [name for name, _, _ in candidates]
+    strategy_combo = ttk.Combobox(
+        strategy_frame,
+        values=strategy_names,
+        state='readonly',
+        width=34
+    )
+    strategy_combo.current(0)
+    strategy_combo.pack(side='left', padx=(6, 10))
+
+    strategy_desc_label = tk.Label(
+        strategy_frame,
+        text='',
+        bg='#f5f5f5', fg='#7f8c8d', font=('Microsoft YaHei', 9), anchor='w'
+    )
+    strategy_desc_label.pack(side='left', fill='x', expand=True)
+
+    def fill_tree(questions):
+        for item in tree.get_children():
+            tree.delete(item)
+
+        for q in questions:
+            if isinstance(q.get('answer'), list):
+                answer_preview = ''.join(q['answer'])
+            else:
+                answer_preview = str(q.get('answer', ''))
+            if not answer_preview.strip():
+                answer_preview = '（未识别）'
+            answer_preview = answer_preview.replace('\n', ' / ').strip()
+            text_preview = str(q.get('text', '')).replace('\n', ' ').strip()
+            if len(text_preview) > 80:
+                text_preview = text_preview[:80] + '...'
+            if len(answer_preview) > 32:
+                answer_preview = answer_preview[:32] + '...'
+
+            tree.insert('', 'end', values=(
+                q.get('id', ''),
+                type_name.get(q.get('type'), q.get('type', '')),
+                answer_preview,
+                text_preview
+            ))
+
+    def refresh_summary(idx):
+        name, questions, desc = candidates[idx]
+        type_count = {'single': 0, 'multi': 0, 'judge': 0, 'blank': 0, 'short': 0}
+        for q in questions:
+            t = q.get('type')
+            if t in type_count:
+                type_count[t] += 1
+
+        summary_text = (
+            f"文件：{os.path.basename(source_path)}  |  方案：{name}  |  共 {len(questions)} 题"
+            f"  |  单选 {type_count['single']}  多选 {type_count['multi']}  判断 {type_count['judge']}"
+            f"  填空 {type_count['blank']}  简答 {type_count['short']}"
+        )
+        top_label.config(text=summary_text)
+        strategy_desc_label.config(text=desc)
+        fill_tree(questions)
+
+    def on_strategy_change(_event=None):
+        idx = strategy_combo.current()
+        if idx < 0:
+            idx = 0
+        selected_idx.set(idx)
+        refresh_summary(idx)
+
+    strategy_combo.bind('<<ComboboxSelected>>', on_strategy_change)
+    refresh_summary(0)
 
     yscroll = ttk.Scrollbar(body, orient='vertical', command=tree.yview)
     xscroll = ttk.Scrollbar(body, orient='horizontal', command=tree.xview)
@@ -1450,7 +2292,7 @@ def show_import_preview(root, questions, source_path):
     )
     hint.pack(fill='x', padx=12, pady=(0, 8))
 
-    result = {'ok': False}
+    result = {'ok': False, 'questions': None}
 
     btn_bar = tk.Frame(win, bg='#f5f5f5')
     btn_bar.pack(fill='x', padx=12, pady=(0, 12))
@@ -1461,6 +2303,10 @@ def show_import_preview(root, questions, source_path):
 
     def on_confirm():
         result['ok'] = True
+        idx = selected_idx.get()
+        if idx < 0 or idx >= len(candidates):
+            idx = 0
+        result['questions'] = candidates[idx][1]
         win.destroy()
 
     tk.Button(
@@ -1482,7 +2328,23 @@ def show_import_preview(root, questions, source_path):
 
     win.protocol('WM_DELETE_WINDOW', on_cancel)
     root.wait_window(win)
-    return result['ok']
+    if result['ok']:
+        return result['questions']
+    return None
+
+
+def _enable_windows_high_dpi():
+    """启用 Windows 高 DPI 感知，避免缩放模糊。"""
+    if os.name != 'nt':
+        return
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
