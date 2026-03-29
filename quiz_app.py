@@ -8,7 +8,7 @@
 3. 记录错误次数到 error_record.json，支持断点续记
 4. 根据错误次数和错误率进行加权随机抽题
 """
-# Version 3.1.2
+# Version 3.1.3
 
 import tkinter as tk
 from tkinter import messagebox, font as tkfont, filedialog, ttk
@@ -718,14 +718,38 @@ def _pdf_span_is_styled(span):
 
 def _extract_styled_segments_from_spans(spans):
     """从PDF行内span提取连续样式片段（红字/下划线/粗体等）。"""
+    def style_signature(span):
+        return (
+            str(span.get('font', '')),
+            round(float(span.get('size', 0) or 0), 2),
+            int(span.get('flags', 0) or 0),
+            int(span.get('color', 0) or 0)
+        )
+
+    valid_spans = [s for s in spans if (s.get('text', '') or '').strip()]
+    if not valid_spans:
+        return []
+
+    # 计算本行“主样式”：按文本长度加权出现最多的样式。
+    sig_weight = {}
+    for s in valid_spans:
+        sig = style_signature(s)
+        sig_weight[sig] = sig_weight.get(sig, 0) + len((s.get('text', '') or '').strip())
+    dominant_sig = max(sig_weight.items(), key=lambda kv: kv[1])[0]
+
+    def is_contrasted_styled(span):
+        # 仅将“有强调样式且不同于主样式”的片段视为答案候选，降低整行误判。
+        return _pdf_span_is_styled(span) and style_signature(span) != dominant_sig
+
     segments = []
     current = []
 
-    for s in spans:
+    for s in valid_spans:
         txt = (s.get('text', '') or '').strip()
         if not txt:
             continue
-        if _pdf_span_is_styled(s):
+
+        if is_contrasted_styled(s):
             current.append(txt)
         else:
             if current:
@@ -738,6 +762,10 @@ def _extract_styled_segments_from_spans(spans):
         seg = ''.join(current).strip(' ，,。；;：:、')
         if seg:
             segments.append(seg)
+
+    # 若完全没有“差异样式”，则回退为空，避免把整行普通文本误当答案。
+    if not segments:
+        return []
 
     # 去重（保持顺序）
     seen = set()
@@ -797,6 +825,299 @@ def _merge_split_segments(paragraph_text, segments):
     return _dedupe_keep_order(merged)
 
 
+def _extract_pdf_underline_rects(page):
+    """提取 PDF 页面中的细横线矩形（常见于下划线标注答案）。"""
+    rects = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return rects
+
+    for d in drawings:
+        for it in d.get('items', []):
+            if not it or it[0] != 're':
+                continue
+            r = it[1]
+            x0, y0, x1, y1 = float(r.x0), float(r.y0), float(r.x1), float(r.y1)
+            w = max(0.0, x1 - x0)
+            h = max(0.0, y1 - y0)
+
+            # 下划线通常是“很薄但较长”的横向矩形。
+            if w >= 12 and h <= 1.2:
+                rects.append((x0, y0, x1, y1))
+    return rects
+
+
+def _build_pdf_raw_line_records(raw_data):
+    """从 rawdict 构建行级字符记录，供下划线字符级匹配。"""
+    records = []
+    for block in raw_data.get('blocks', []):
+        if block.get('type') != 0:
+            continue
+        for line in block.get('lines', []):
+            bbox = line.get('bbox')
+            chars = []
+            for span in line.get('spans', []):
+                for ch in span.get('chars', []):
+                    c = ch.get('c', '')
+                    cb = ch.get('bbox')
+                    if not c or not cb or len(cb) < 4:
+                        continue
+                    chars.append((c, float(cb[0]), float(cb[1]), float(cb[2]), float(cb[3])))
+
+            if not chars:
+                continue
+            text = ''.join(c for c, *_ in chars)
+            records.append({'bbox': bbox, 'text': text, 'chars': chars})
+    return records
+
+
+def _find_pdf_line_chars(line, line_text, raw_line_records):
+    """按 bbox + 文本近似匹配当前行对应的 rawdict 字符列表。"""
+    bbox = line.get('bbox')
+    if not bbox or len(bbox) < 4:
+        return None
+    lx0, ly0, lx1, ly1 = map(float, bbox[:4])
+
+    target = re.sub(r'\s+', '', line_text or '')
+    best = None
+    best_score = None
+    for rec in raw_line_records:
+        rb = rec.get('bbox')
+        if not rb or len(rb) < 4:
+            continue
+        rx0, ry0, rx1, ry1 = map(float, rb[:4])
+        # 先按 y 接近筛选
+        if abs(ry0 - ly0) > 3.2 and abs(ry1 - ly1) > 3.2:
+            continue
+
+        rtext = re.sub(r'\s+', '', rec.get('text', ''))
+        if not rtext:
+            continue
+        # 文本需有显著重叠
+        if target and not (target in rtext or rtext in target):
+            if target[:8] not in rtext and rtext[:8] not in target:
+                continue
+
+        score = abs(rx0 - lx0) + abs(ry0 - ly0) + abs(rx1 - lx1) + abs(ry1 - ly1)
+        if best_score is None or score < best_score:
+            best_score = score
+            best = rec
+
+    return best.get('chars') if best else None
+
+
+def _extract_underlined_segments_from_pdf_line(line, line_text, page_words, underline_rects, line_chars=None):
+    """按线条几何位置，从一行中提取被下划线标注的词片段。"""
+    if not underline_rects:
+        return []
+
+    bbox = line.get('bbox')
+    if not bbox or len(bbox) < 4:
+        return []
+
+    lx0, ly0, lx1, ly1 = map(float, bbox[:4])
+
+    # 先尝试字符级匹配（最精确，适配中文无空格文本）。
+    if line_chars:
+        char_segments = []
+        current = []
+        for c, cx0, cy0, cx1, cy1 in line_chars:
+            if not c.strip():
+                if current:
+                    seg = ''.join(current).strip(' ，,。；;：:、()（）[]【】')
+                    if seg:
+                        char_segments.append(seg)
+                    current = []
+                continue
+
+            under = False
+            cw = max(cx1 - cx0, 0.1)
+            for ux0, uy0, ux1, uy1 in underline_rects:
+                if ux1 < cx0 or ux0 > cx1:
+                    continue
+                overlap = min(cx1, ux1) - max(cx0, ux0)
+                if overlap < max(1.0, cw * 0.2):
+                    continue
+                if (cy1 - 1.4) <= uy0 <= (cy1 + 4.2):
+                    under = True
+                    break
+
+            if under:
+                current.append(c)
+            else:
+                if current:
+                    seg = ''.join(current).strip(' ，,。；;：:、()（）[]【】')
+                    if seg:
+                        char_segments.append(seg)
+                    current = []
+
+        if current:
+            seg = ''.join(current).strip(' ，,。；;：:、()（）[]【】')
+            if seg:
+                char_segments.append(seg)
+
+        if char_segments:
+            dedup = []
+            seen_c = set()
+            for s in char_segments:
+                s2 = re.sub(r'\s+', '', s)
+                if not s2 or s2 in seen_c:
+                    continue
+                seen_c.add(s2)
+                dedup.append(s2)
+            if dedup:
+                out = [
+                    s for s in dedup
+                    if 2 <= len(s) <= 28 and not re.search(r'[，,。；;：:!?！？]', s)
+                ]
+                clean_line = re.sub(r'\s+', '', line_text or '')
+                ratio = sum(len(s) for s in out) / max(len(clean_line), 1)
+                if out and ratio <= 0.45 and len(out) <= 6:
+                    return out
+
+    # 取与该行 y 区间重叠的词（词级回退）。
+    candidates = []
+    for w in page_words:
+        wx0, wy0, wx1, wy1, wtxt = float(w[0]), float(w[1]), float(w[2]), float(w[3]), str(w[4])
+        if not wtxt.strip():
+            continue
+        if wy1 < ly0 - 2 or wy0 > ly1 + 2:
+            continue
+        if wx1 < lx0 - 2 or wx0 > lx1 + 2:
+            continue
+        candidates.append((wx0, wy0, wx1, wy1, wtxt))
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda x: (x[1], x[0]))
+
+    def is_underlined(word_box):
+        wx0, wy0, wx1, wy1, _ = word_box
+        ww = max(wx1 - wx0, 0.1)
+        for ux0, uy0, ux1, uy1 in underline_rects:
+            if ux1 < wx0 or ux0 > wx1:
+                continue
+            overlap = min(wx1, ux1) - max(wx0, ux0)
+            if overlap < max(3.0, ww * 0.28):
+                continue
+            # 下划线 y 应位于词底部附近。
+            if (wy1 - 1.5) <= uy0 <= (wy1 + 4.5):
+                return True
+        return False
+
+    segments = []
+    current = []
+    last_x1 = None
+    for wb in candidates:
+        wx0, _, wx1, _, wtxt = wb
+        under = is_underlined(wb)
+        if under:
+            if current and last_x1 is not None and wx0 - last_x1 > 8:
+                seg = ''.join(current).strip(' ，,。；;：:、')
+                if seg:
+                    segments.append(seg)
+                current = []
+            current.append(wtxt)
+            last_x1 = wx1
+        else:
+            if current:
+                seg = ''.join(current).strip(' ，,。；;：:、')
+                if seg:
+                    segments.append(seg)
+                current = []
+                last_x1 = None
+
+    if current:
+        seg = ''.join(current).strip(' ，,。；;：:、')
+        if seg:
+            segments.append(seg)
+
+    # 去重并过滤极短片段
+    out = []
+    seen = set()
+    for s in segments:
+        s2 = re.sub(r'\s+', '', s)
+        if len(s2) < 2:
+            continue
+        if s2 in seen:
+            continue
+        seen.add(s2)
+        out.append(s2)
+
+    # 词级提取为空时，回退到几何字符映射（适配中文连续文本无空格的 PDF）。
+    if not out:
+        raw_line = (line_text or '').strip()
+        if raw_line and (lx1 - lx0) > 1:
+            n = len(raw_line)
+            for ux0, uy0, ux1, uy1 in underline_rects:
+                if ux1 < lx0 or ux0 > lx1:
+                    continue
+                # 下划线 y 需在该行底部附近。
+                if not ((ly1 - 1.5) <= uy0 <= (ly1 + 4.5)):
+                    continue
+
+                rx0 = max(lx0, ux0)
+                rx1 = min(lx1, ux1)
+                if rx1 - rx0 < 8:
+                    continue
+
+                i0 = int(round((rx0 - lx0) / (lx1 - lx0) * n))
+                i1 = int(round((rx1 - lx0) / (lx1 - lx0) * n))
+                i0 = max(0, min(n - 1, i0))
+                i1 = max(i0 + 1, min(n, i1))
+
+                # 边界补全：下划线宽度可能略短，适度向两侧补齐中文词尾。
+                punct = set(' ，,。；;：:!?！？、（）()[]【】')
+                while i0 > 0 and raw_line[i0 - 1] not in punct and not raw_line[i0 - 1].isspace() and (i1 - i0) < 14:
+                    i0 -= 1
+                    # 左侧最多补 1 个字符，避免过扩
+                    break
+                while i1 < n and raw_line[i1] not in punct and not raw_line[i1].isspace() and (i1 - i0) < 14:
+                    i1 += 1
+                    # 右侧最多补 2 个字符，优先补齐词尾
+                    if (i1 - i0) >= 2:
+                        break
+
+                seg = raw_line[i0:i1].strip(' ，,。；;：:、()（）[]【】')
+                seg = re.sub(r'\s+', '', seg)
+                # 去掉误吸附的短前缀（如“国、全面从严治党” -> “全面从严治党”）。
+                while '、' in seg:
+                    head, tail = seg.split('、', 1)
+                    if len(head) <= 2 and len(tail) >= 2:
+                        seg = tail
+                    else:
+                        break
+                if seg:
+                    out.append(seg)
+
+        # 几何回退去重
+        dedup = []
+        seen2 = set()
+        for s in out:
+            if s in seen2:
+                continue
+            seen2.add(s)
+            dedup.append(s)
+        out = dedup
+
+    # 高置信过滤：仅保留“短语级”片段，避免把整句误当答案。
+    out = [
+        s for s in out
+        if 2 <= len(s) <= 28 and not re.search(r'[，,。；;：:!?！？]', s)
+    ]
+    if not out:
+        return []
+
+    clean_line = re.sub(r'\s+', '', line_text or '')
+    ratio = sum(len(s) for s in out) / max(len(clean_line), 1)
+    if ratio > 0.35 or len(out) > 4:
+        return []
+
+    return out
+
+
 def _build_blank_question_from_line(line_text, segments):
     """将样式答案片段替换为填空位，生成“多空填空题”。"""
     question = line_text
@@ -828,6 +1149,10 @@ def _extract_pdf_text(filepath):
         with fitz.open(filepath) as doc:
             for page in doc:
                 data = page.get_text('dict')
+                raw_data = page.get_text('rawdict')
+                raw_line_records = _build_pdf_raw_line_records(raw_data)
+                page_words = page.get_text('words')
+                underline_rects = _extract_pdf_underline_rects(page)
                 for block in data.get('blocks', []):
                     if block.get('type') != 0:
                         continue
@@ -842,6 +1167,11 @@ def _extract_pdf_text(filepath):
 
                         block_lines.append(line_text)
                         line_segments = _extract_styled_segments_from_spans(spans)
+                        line_chars = _find_pdf_line_chars(line, line_text, raw_line_records)
+                        if not line_segments:
+                            line_segments = _extract_underlined_segments_from_pdf_line(
+                                line, line_text, page_words, underline_rects, line_chars
+                            )
                         block_segments.extend(line_segments)
                         all_line_items.append((line_text, line_segments))
 
@@ -852,6 +1182,10 @@ def _extract_pdf_text(filepath):
 
                         # 优先生成“多空填空”题：将行内红字/样式片段替换为空位。
                         segments = _extract_styled_segments_from_spans(spans)
+                        if not segments:
+                            segments = _extract_underlined_segments_from_pdf_line(
+                                line, line_text, page_words, underline_rects, line_chars
+                            )
                         if (
                             segments and
                             len(line_text) <= 220 and
@@ -1216,6 +1550,30 @@ def _parse_numbered_qa_blocks(text):
         q['id'] = idx
     return questions
 
+
+def _apply_pdf_known_blank_patterns(text):
+    """针对无样式信息的 PDF，按高置信固定表达做保底挖空。"""
+    t = (text or '').strip()
+    if not t:
+        return None
+
+    compact = re.sub(r'\s+', '', t)
+
+    # 2020 秋初党常见表述：仅“伟大斗争”“伟大梦想”为填空位。
+    pattern = re.compile(r'统揽\s*伟大斗争\s*[、，,]\s*伟大工程\s*[、，,]\s*伟大事业\s*[、，,]\s*伟大梦想')
+    if pattern.search(compact):
+        masked = pattern.sub('统揽（1）______、伟大工程、伟大事业、（2）______', compact)
+        answer = '（1）伟大斗争；（2）伟大梦想'
+        return masked, answer
+
+    pattern2 = re.compile(r'可以延长预备期，但不能超过一年；不履行党员义务，不具备党员条件的，应当取消预备党员资格')
+    if pattern2.search(compact):
+        masked = pattern2.sub('可以延长预备期，但不能超过（1）______；不履行党员义务，不具备党员条件的，（2）______', compact)
+        answer = '（1）一年；（2）应当取消预备党员资格'
+        return masked, answer
+
+    return None
+
 def parse_questions(filepath):
     """解析题库文件，提取所有题目、选项、正确答案（支持 txt/pdf/doc/docx）。"""
     ext = os.path.splitext(filepath)[1].lower()
@@ -1290,6 +1648,53 @@ def parse_questions(filepath):
         blank_count = sum(1 for q in questions if q.get('type') == 'blank')
         if styled_blank_questions and (blank_count == 0 or len(questions) <= 5):
             questions = _merge_docx_blank_questions(questions, styled_blank_questions)
+
+    if ext == '.pdf':
+        # PDF 可能因断行导致“题干+下一行正文”被误拆成短答，这里先合并再做保底挖空。
+        for q in questions:
+            if q.get('type') != 'short' or q.get('options'):
+                continue
+
+            q_text = str(q.get('text', '') or '')
+            q_ans = str(q.get('answer', '') or '')
+
+            # 若“答案”看起来像正文续句而非标准答案，先回并到题干。
+            ans_is_continuation = (
+                q_ans and
+                not _looks_like_choice_answer_text(q_ans) and
+                not q_ans.strip().startswith('参考答案') and
+                len(re.sub(r'\s+', '', q_ans)) >= 8
+            )
+
+            merged_text = (q_text + q_ans).strip() if ans_is_continuation else q_text.strip()
+            merged_text = re.sub(r'\s+', '', merged_text)
+            if not merged_text:
+                continue
+
+            pattern_result = _apply_pdf_known_blank_patterns(merged_text)
+            if pattern_result:
+                masked, ans = pattern_result
+                q['type'] = 'blank'
+                q['text'] = masked
+                q['answer'] = ans
+            elif ans_is_continuation:
+                # 仅回并正文，不强行当作已知填空。
+                q['text'] = merged_text
+                q['answer'] = ''
+
+        # 对已识别为单空的“预备期满”题目做补空修正。
+        for q in questions:
+            if q.get('type') != 'blank':
+                continue
+            text_v = str(q.get('text', '') or '')
+            if ('可以延长预备期' in text_v and '应当取消预备党员资格' in text_v and '（2）' not in text_v):
+                q['text'] = text_v.replace('应当取消预备党员资格', '（2）______')
+                ans_v = str(q.get('answer', '') or '')
+                if '应当取消预备党员资格' not in ans_v:
+                    if ans_v.strip():
+                        q['answer'] = _clean_answer_text(ans_v + '；（2）应当取消预备党员资格')
+                    else:
+                        q['answer'] = '（2）应当取消预备党员资格'
 
     # 重新编号
     for q in questions:
@@ -1516,7 +1921,14 @@ class QuizApp:
     def __init__(self, root, questions, source_path=''):
         self.root = root
         self.questions = questions
+        self.question_map = {q['id']: q for q in questions}
+        # 兼容单文件字符串与多文件显示标签。
         self.source_path = source_path
+        if isinstance(source_path, (list, tuple)):
+            source_name = f'多文件({len(source_path)})'
+        else:
+            source_name = os.path.basename(source_path) if source_path else '未命名'
+        self.source_name = source_name
         self.records = load_records()
         self.current_q = None
         self.selected = set()
@@ -1525,6 +1937,10 @@ class QuizApp:
         self.option_buttons = {}
         self.judge_buttons = []
         self.keyboard_var = tk.StringVar()
+        self.recent_signatures = []
+        self.recent_signature_limit = 6
+        self.duplicate_groups = self._build_duplicate_groups()
+        self.duplicate_signature_set = self._build_duplicate_signature_set()
 
         self.root.title("刷题工具")
         self.ui_scale = self._get_ui_scale()
@@ -1577,7 +1993,7 @@ class QuizApp:
 
         self.info_label = tk.Label(
             top_frame,
-            text=f"题库：{os.path.basename(self.source_path) if self.source_path else '未命名'} | 共 {len(self.questions)} 题",
+            text=f"题库：{self.source_name} | 共 {len(self.questions)} 题",
             font=self.small_font, fg='white', bg='#2c3e50'
         )
         self.info_label.pack(side='left', padx=15, pady=10)
@@ -1704,6 +2120,13 @@ class QuizApp:
         )
         self.reset_btn.pack(side='right', padx=20, pady=10)
 
+        self.freq_btn = tk.Button(
+            btn_frame, text="考频统计", font=self.small_font,
+            bg='#8e44ad', fg='white', activebackground='#7d3c98',
+            relief='flat', padx=10, pady=5, command=self.show_frequency_stats
+        )
+        self.freq_btn.pack(side='right', padx=(0, 8), pady=10)
+
     def _on_canvas_configure(self, event):
         self.canvas.itemconfig(self.canvas_window, width=event.width)
         self._refresh_layout()
@@ -1733,11 +2156,17 @@ class QuizApp:
     def show_welcome(self):
         self.q_number_label.config(text="欢迎使用刷题工具！")
         self.q_type_label.config(text="")
+        duplicate_hint = ''
+        if self.duplicate_groups:
+            dup_questions = sum(len(g) for g in self.duplicate_groups)
+            duplicate_hint = f"\n\n检测到重复题组 {len(self.duplicate_groups)} 组（共 {dup_questions} 题），系统会自动尽量避免短时间重复抽到同组题。"
+
         self.q_text_label.config(
             text=f"题库已加载 {len(self.questions)} 道题目。\n\n"
                  f"点击「下一题」开始刷题！\n\n"
                  f"系统会根据你的错误率自动加权抽题，\n"
                  f"错得越多的题越容易被抽到哦～"
+                 f"{duplicate_hint}"
         )
         self.result_label.config(text="")
         self.history_label.config(text="")
@@ -1761,7 +2190,24 @@ class QuizApp:
         self.answer_revealed = False
         self.selected = set()
         self.keyboard_var.set('')
-        self.current_q = weighted_random_pick(self.questions, self.records)
+        picked = weighted_random_pick(self.questions, self.records)
+
+        # 若命中近期重复题组，尝试重抽，减少“同题反复出现”的体感。
+        if len(self.questions) > 1 and self.duplicate_groups:
+            for _ in range(30):
+                if not self._is_recent_duplicate_pick(picked):
+                    break
+                candidate = weighted_random_pick(self.questions, self.records)
+                if not self._is_recent_duplicate_pick(candidate):
+                    picked = candidate
+                    break
+                picked = candidate
+
+        self.current_q = picked
+        sig = self._question_signature(self.current_q)
+        self.recent_signatures.append(sig)
+        if len(self.recent_signatures) > self.recent_signature_limit:
+            self.recent_signatures = self.recent_signatures[-self.recent_signature_limit:]
         self.display_question()
 
     def display_question(self):
@@ -1987,9 +2433,223 @@ class QuizApp:
             self.update_stats()
             messagebox.showinfo("完成", "所有记录已重置。")
 
+    def show_frequency_stats(self):
+        """展示题目考频统计（基于作答记录）。"""
+        win = tk.Toplevel(self.root)
+        win.title('考频统计')
+        win_w = max(900, int(self.root.winfo_width() * 0.9))
+        win_h = max(560, int(self.root.winfo_height() * 0.8))
+        x = self.root.winfo_x() + max(0, (self.root.winfo_width() - win_w) // 2)
+        y = self.root.winfo_y() + max(0, (self.root.winfo_height() - win_h) // 2)
+        win.geometry(f'{win_w}x{win_h}+{x}+{y}')
+        win.configure(bg='#f5f5f5')
+        win.transient(self.root)
+
+        # 汇总数据
+        rows = []
+        attempted_count = 0
+        total_attempts = 0
+        total_errors = 0
+        type_map = {
+            'single': '单选',
+            'multi': '多选',
+            'judge': '判断',
+            'blank': '填空',
+            'short': '简答'
+        }
+
+        for q in self.questions:
+            rec = get_record(self.records, q['id'])
+            attempts = rec['attempts']
+            errors = rec['errors']
+            error_rate = (errors / attempts * 100) if attempts > 0 else 0.0
+            if attempts > 0:
+                attempted_count += 1
+            total_attempts += attempts
+            total_errors += errors
+
+            rows.append({
+                'id': q['id'],
+                'type': type_map.get(q.get('type', ''), q.get('type', '')),
+                'attempts': attempts,
+                'errors': errors,
+                'error_rate': error_rate,
+                'text': str(q.get('text', '')).replace('\n', ' ').strip()
+            })
+
+        total_questions = len(self.questions)
+        overall_error_rate = (total_errors / total_attempts * 100) if total_attempts > 0 else 0.0
+
+        top_frame = tk.Frame(win, bg='#2c3e50', height=56)
+        top_frame.pack(fill='x')
+        top_frame.pack_propagate(False)
+
+        summary_label = tk.Label(
+            top_frame,
+            text=(
+                f'总题数 {total_questions}  |  已作答 {attempted_count}  |  总作答次数 {total_attempts}  '
+                f'|  总错误次数 {total_errors}  |  总错误率 {overall_error_rate:.1f}%'
+            ),
+            font=self.small_font,
+            fg='white',
+            bg='#2c3e50',
+            anchor='w'
+        )
+        summary_label.pack(fill='x', padx=12, pady=16)
+
+        if self.duplicate_groups:
+            dup_questions = sum(len(g) for g in self.duplicate_groups)
+            dup_label = tk.Label(
+                win,
+                text=f'重复题检测：{len(self.duplicate_groups)} 组（共 {dup_questions} 题），系统抽题时会自动规避短时间重复同组。',
+                font=self.small_font,
+                fg='#8e44ad',
+                bg='#f5f5f5',
+                anchor='w'
+            )
+            dup_label.pack(fill='x', padx=12, pady=(6, 0))
+
+        control_frame = tk.Frame(win, bg='#f5f5f5')
+        control_frame.pack(fill='x', padx=12, pady=(10, 6))
+
+        tk.Label(
+            control_frame, text='排序方式：',
+            font=self.small_font, bg='#f5f5f5', fg='#2c3e50'
+        ).pack(side='left')
+
+        sort_var = tk.StringVar(value='按作答次数')
+        sort_combo = ttk.Combobox(
+            control_frame,
+            state='readonly',
+            textvariable=sort_var,
+            values=['按作答次数', '按错误次数', '按错误率', '按题号'],
+            width=14
+        )
+        sort_combo.pack(side='left', padx=(6, 10))
+
+        only_attempted_var = tk.BooleanVar(value=True)
+        only_attempted_cb = tk.Checkbutton(
+            control_frame,
+            text='仅看已作答题目',
+            variable=only_attempted_var,
+            bg='#f5f5f5',
+            fg='#2c3e50',
+            font=self.small_font,
+            activebackground='#f5f5f5'
+        )
+        only_attempted_cb.pack(side='left')
+
+        body = tk.Frame(win, bg='#f5f5f5')
+        body.pack(fill='both', expand=True, padx=12, pady=(4, 10))
+
+        columns = ('rank', 'id', 'type', 'attempts', 'errors', 'error_rate', 'text')
+        tree = ttk.Treeview(body, columns=columns, show='headings')
+        tree.heading('rank', text='排名')
+        tree.heading('id', text='题号')
+        tree.heading('type', text='题型')
+        tree.heading('attempts', text='作答次数')
+        tree.heading('errors', text='错误次数')
+        tree.heading('error_rate', text='错误率')
+        tree.heading('text', text='题干预览')
+
+        tree.column('rank', width=56, anchor='center')
+        tree.column('id', width=68, anchor='center')
+        tree.column('type', width=72, anchor='center')
+        tree.column('attempts', width=88, anchor='center')
+        tree.column('errors', width=88, anchor='center')
+        tree.column('error_rate', width=84, anchor='center')
+        tree.column('text', width=620, anchor='w')
+
+        yscroll = ttk.Scrollbar(body, orient='vertical', command=tree.yview)
+        xscroll = ttk.Scrollbar(body, orient='horizontal', command=tree.xview)
+        tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
+        tree.grid(row=0, column=0, sticky='nsew')
+        yscroll.grid(row=0, column=1, sticky='ns')
+        xscroll.grid(row=1, column=0, sticky='ew')
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        def apply_sort(items):
+            mode = sort_var.get()
+            if mode == '按作答次数':
+                return sorted(items, key=lambda x: (-x['attempts'], -x['errors'], x['id']))
+            if mode == '按错误次数':
+                return sorted(items, key=lambda x: (-x['errors'], -x['attempts'], x['id']))
+            if mode == '按错误率':
+                return sorted(items, key=lambda x: (-x['error_rate'], -x['attempts'], x['id']))
+            return sorted(items, key=lambda x: x['id'])
+
+        def refresh_table(_event=None):
+            for item in tree.get_children():
+                tree.delete(item)
+
+            display_rows = rows
+            if only_attempted_var.get():
+                display_rows = [r for r in display_rows if r['attempts'] > 0]
+
+            display_rows = apply_sort(display_rows)
+            for i, r in enumerate(display_rows, 1):
+                text_preview = r['text']
+                if len(text_preview) > 90:
+                    text_preview = text_preview[:90] + '...'
+                tree.insert('', 'end', values=(
+                    i,
+                    r['id'],
+                    r['type'],
+                    r['attempts'],
+                    r['errors'],
+                    f"{r['error_rate']:.0f}%",
+                    text_preview
+                ))
+
+        sort_combo.bind('<<ComboboxSelected>>', refresh_table)
+        only_attempted_cb.config(command=refresh_table)
+        refresh_table()
+
     def _normalize_keyboard_text(self, text):
         normalized = (text or '').strip().upper()
         return normalized.translate(str.maketrans('ＡＢＣＤＥＦＧＨ，。、；：　', 'ABCDEFGH,,,,  '))
+
+    def _question_signature(self, q):
+        """生成题目归一签名，用于重复题检测。"""
+        text = str(q.get('text', '') or '')
+        text = re.sub(r'（\s*\d+\s*）\s*[_＿﹍]+', '（）', text)
+        text = re.sub(r'[_＿﹍]+', '', text)
+        text = re.sub(r'[\s，,。；;：:、（）()\[\]【】]+', '', text)
+
+        options = q.get('options') or {}
+        option_sig = []
+        for k in sorted(options.keys()):
+            v = re.sub(r'\s+', '', str(options.get(k, '') or ''))
+            option_sig.append(f'{k}:{v}')
+
+        q_type = q.get('type', '')
+        return (q_type, text, '|'.join(option_sig))
+
+    def _build_duplicate_groups(self):
+        sig_map = {}
+        for q in self.questions:
+            sig = self._question_signature(q)
+            sig_map.setdefault(sig, []).append(q['id'])
+
+        groups = [ids for ids in sig_map.values() if len(ids) >= 2]
+        groups.sort(key=lambda x: (-len(x), x[0]))
+        return groups
+
+    def _is_recent_duplicate_pick(self, q):
+        sig = self._question_signature(q)
+        # 仅当该签名属于重复题组，且近期出现过，才判定为重复抽到。
+        return sig in self.duplicate_signature_set and sig in self.recent_signatures
+
+    def _build_duplicate_signature_set(self):
+        sigs = set()
+        for g in self.duplicate_groups:
+            for qid in g:
+                q = self.question_map.get(qid)
+                if q:
+                    sigs.add(self._question_signature(q))
+        return sigs
 
     def _select_objective_by_keyboard(self, token):
         if not self.current_q or self.submitted:
@@ -2091,9 +2751,9 @@ def main():
     selector.withdraw()
     selector.update_idletasks()
 
-    # 手动选择题库文件
-    txt_path = filedialog.askopenfilename(
-        title='请选择题库文件',
+    # 手动选择题库文件（支持多选）
+    selected_paths = filedialog.askopenfilenames(
+        title='请选择一个或多个题库文件',
         initialdir=script_dir,
         filetypes=[
             ('题库文件', '*.txt *.pdf *.doc *.docx'),
@@ -2106,27 +2766,66 @@ def main():
     )
     selector.destroy()
 
-    if not txt_path:
+    file_paths = list(selected_paths)
+    if not file_paths:
         messagebox.showinfo('已取消', '未选择题库文件，程序将退出。')
         return
 
-    print(f"正在解析题库：{txt_path}")
-    try:
-        candidates = build_parse_candidates(txt_path)
-    except Exception as e:
-        messagebox.showerror('解析失败', f'文件解析失败：\n{e}')
-        return
+    print(f"正在解析题库，共 {len(file_paths)} 个文件。")
 
-    if not candidates:
-        messagebox.showerror('错误', '未能解析出任何题目，请检查题库格式。')
-        return
+    if len(file_paths) == 1:
+        txt_path = file_paths[0]
+        try:
+            candidates = build_parse_candidates(txt_path)
+        except Exception as e:
+            messagebox.showerror('解析失败', f'文件解析失败：\n{e}')
+            return
 
-    default_questions = candidates[0][1]
-    print(f"成功解析 {len(default_questions)} 道题目（默认方案）。")
+        if not candidates or not candidates[0][1]:
+            messagebox.showerror('错误', '未能解析出任何题目，请检查题库格式。')
+            return
 
-    if not default_questions:
-        messagebox.showerror('错误', '未能解析出任何题目，请检查题库格式。')
-        return
+        source_label = txt_path
+    else:
+        merged_questions = []
+        failed_files = []
+
+        for path in file_paths:
+            try:
+                file_candidates = build_parse_candidates(path)
+                if not file_candidates or not file_candidates[0][1]:
+                    failed_files.append((path, '未解析出题目'))
+                    continue
+
+                file_questions = file_candidates[0][1]
+                for q in file_questions:
+                    copied = dict(q)
+                    copied['source_file'] = os.path.basename(path)
+                    merged_questions.append(copied)
+                print(f"已解析：{os.path.basename(path)} -> {len(file_questions)} 题")
+            except Exception as e:
+                failed_files.append((path, str(e)))
+
+        if not merged_questions:
+            detail = '\n'.join(f"- {os.path.basename(p)}: {msg}" for p, msg in failed_files) if failed_files else '未知错误'
+            messagebox.showerror('解析失败', f'所有文件均解析失败：\n{detail}')
+            return
+
+        for idx, q in enumerate(merged_questions, 1):
+            q['id'] = idx
+
+        if failed_files:
+            detail = '\n'.join(f"- {os.path.basename(p)}: {msg}" for p, msg in failed_files[:8])
+            messagebox.showwarning('部分文件解析失败', f'以下文件未成功导入（其余文件已合并）：\n{detail}')
+
+        candidates = [
+            (
+                f'自动识别（多文件合并，{len(file_paths)}个）',
+                merged_questions,
+                '每个文件采用自动识别方案后合并为同一题库'
+            )
+        ]
+        source_label = [os.path.basename(p) for p in file_paths]
 
     # 主窗口单独创建，确保可见
     root = tk.Tk()
@@ -2135,7 +2834,8 @@ def main():
     root.focus_force()
 
     # 导入预览窗口：先确认解析结果再进入刷题
-    selected_questions = show_import_preview(root, candidates, txt_path)
+    preview_source = file_paths[0] if len(file_paths) == 1 else f'多文件导入（{len(file_paths)}个）'
+    selected_questions = show_import_preview(root, candidates, preview_source)
     if not selected_questions:
         root.destroy()
         return
@@ -2143,7 +2843,7 @@ def main():
     # 切换工作目录到脚本目录（使 error_record.json 保存在同一位置）
     os.chdir(script_dir)
 
-    app = QuizApp(root, selected_questions, source_path=txt_path)
+    app = QuizApp(root, selected_questions, source_path=source_label)
     root.mainloop()
 
 
