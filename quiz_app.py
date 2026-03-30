@@ -8,7 +8,8 @@
 3. 记录错误次数到 error_record.json，支持断点续记
 4. 根据错误次数和错误率进行加权随机抽题
 """
-# Version 3.2.1
+# Version 3.2.2
+#author：duya2007,ChatGPT-5.3-Codex
 
 import tkinter as tk
 from tkinter import messagebox, font as tkfont, filedialog, ttk
@@ -3589,6 +3590,83 @@ class QuizApp:
         )
         only_attempted_cb.pack(side='left')
 
+        def open_selected_question_detail(_event=None):
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning('提示', '请先选择一题。', parent=win)
+                return
+
+            try:
+                qid = int(selected[0])
+            except Exception:
+                return
+
+            q = self.question_map.get(qid)
+            if not q:
+                messagebox.showerror('错误', '未找到题目详情。', parent=win)
+                return
+
+            detail_win = tk.Toplevel(win)
+            detail_win.title(f'题目详情 - 第 {qid} 题')
+            d_w = max(760, int(win.winfo_width() * 0.75))
+            d_h = max(520, int(win.winfo_height() * 0.75))
+            x = win.winfo_x() + max(0, (win.winfo_width() - d_w) // 2)
+            y = win.winfo_y() + max(0, (win.winfo_height() - d_h) // 2)
+            detail_win.geometry(f'{d_w}x{d_h}+{x}+{y}')
+            detail_win.configure(bg='#f5f5f5')
+            detail_win.transient(win)
+
+            type_map_rev = {
+                'single': '单选',
+                'multi': '多选',
+                'judge': '判断',
+                'blank': '填空',
+                'short': '简答'
+            }
+            rec = get_record(self.records, q)
+            error_rate = (rec['errors'] / rec['attempts'] * 100) if rec['attempts'] > 0 else 0.0
+
+            head = tk.Label(
+                detail_win,
+                text=(
+                    f"第 {qid} 题  |  题型：{type_map_rev.get(q.get('type', ''), q.get('type', ''))}"
+                    f"  |  作答 {rec['attempts']} 次  错误 {rec['errors']} 次  错误率 {error_rate:.0f}%"
+                ),
+                bg='#2c3e50', fg='white', anchor='w',
+                font=('Microsoft YaHei', 10)
+            )
+            head.pack(fill='x', ipady=10)
+
+            text_box = tk.Text(detail_win, wrap='word', font=('Microsoft YaHei', 11), relief='flat')
+            yscroll_detail = ttk.Scrollbar(detail_win, orient='vertical', command=text_box.yview)
+            text_box.configure(yscrollcommand=yscroll_detail.set)
+            text_box.pack(side='left', fill='both', expand=True, padx=(12, 0), pady=12)
+            yscroll_detail.pack(side='left', fill='y', pady=12, padx=(0, 12))
+
+            text_box.insert('end', '题干：\n')
+            text_box.insert('end', str(q.get('text', '') or '') + '\n\n')
+
+            options = q.get('options') or {}
+            if options:
+                text_box.insert('end', '选项：\n')
+                for k in sorted(options.keys()):
+                    text_box.insert('end', f"{k}. {options.get(k, '')}\n")
+                text_box.insert('end', '\n')
+
+            answer = q.get('answer', '')
+            answer_text = ''.join(answer) if isinstance(answer, list) else str(answer)
+            text_box.insert('end', f'答案：\n{answer_text}\n')
+            text_box.config(state='disabled')
+
+        tk.Button(
+            control_frame,
+            text='查看所选题',
+            font=self.small_font,
+            bg='#3498db', fg='white', activebackground='#2980b9',
+            relief='flat', padx=10, pady=4,
+            command=open_selected_question_detail
+        ).pack(side='right')
+
         body = tk.Frame(win, bg='#f5f5f5')
         body.pack(fill='both', expand=True, padx=12, pady=(4, 10))
 
@@ -3643,7 +3721,7 @@ class QuizApp:
                 text_preview = r['text']
                 if len(text_preview) > 90:
                     text_preview = text_preview[:90] + '...'
-                tree.insert('', 'end', values=(
+                tree.insert('', 'end', iid=str(r['id']), values=(
                     i,
                     r['id'],
                     r['type'],
@@ -3655,6 +3733,7 @@ class QuizApp:
 
         sort_combo.bind('<<ComboboxSelected>>', refresh_table)
         only_attempted_cb.config(command=refresh_table)
+        tree.bind('<Double-1>', open_selected_question_detail)
         refresh_table()
 
     def _normalize_keyboard_text(self, text):
