@@ -8,7 +8,7 @@
 3. 记录错误次数到 error_record.json，支持断点续记
 4. 根据错误次数和错误率进行加权随机抽题
 """
-# Version 3.1.3
+# Version 3.2.1
 
 import tkinter as tk
 from tkinter import messagebox, font as tkfont, filedialog, ttk
@@ -17,6 +17,8 @@ import json
 import os
 import random
 import math
+import hashlib
+from datetime import datetime
 import ctypes
 import tempfile
 import zipfile
@@ -28,6 +30,149 @@ ANSWER_LABEL_RE = re.compile(r'^(?:正确答案|答案|参考答案|标准答案
 QUESTION_START_RE = re.compile(r'^\s*(?:\d{1,4}(?:[、．\)]|[.](?!\d))|[一二三四五六七八九十百零]+[.、．\)])\s*')
 OPTION_PREFIX_RE = re.compile(r'^\s*([A-HＡ-Ｈ])[.、．,，\)）:：]\s*')
 OPTION_TOKEN_RE = re.compile(r'([A-HＡ-Ｈ])[.、．,，\)）:：]\s*')
+OPTION_MARKER_SYMBOLS = ('\uf0fe', '☑', '✅', '√', '✔', '☒', '✘', '✗')
+SECTION_HEADING_PATTERNS = (
+    ('single', re.compile(r'^\s*单选题\s*$')),
+    ('multi', re.compile(r'^\s*多选题\s*$')),
+    ('judge', re.compile(r'^\s*判断题\s*$')),
+    ('blank', re.compile(r'^\s*填空题\s*$')),
+    ('short', re.compile(r'^\s*简答题\s*$')),
+)
+
+
+def _clean_option_text(text):
+    """清理选项中的版式残留符号（项目符号/勾选符号等）。"""
+    t = str(text or '')
+    t = re.sub(r'[\uf0b7\u2022]+', ' ', t)
+    t = re.sub(r'[\uf0fe☑✅√✔☒✘✗]+', ' ', t)
+    t = re.sub(r'\s{2,}', ' ', t)
+    return t.strip()
+
+
+def _option_contains_answer_marker(text):
+    """判断选项文本是否包含“被选中/勾选”样式标记。"""
+    t = str(text or '')
+    return any(sym in t for sym in OPTION_MARKER_SYMBOLS)
+
+
+def _extract_choice_answer_from_option_format(options):
+    """从选项格式差异中提取答案（如带勾选符号的选项）。"""
+    marked = []
+    for k, v in options.items():
+        if _option_contains_answer_marker(v):
+            marked.append(k)
+    return marked
+
+
+def _detect_section_heading(text):
+    t = (text or '').strip()
+    for sec, pat in SECTION_HEADING_PATTERNS:
+        if pat.match(t):
+            return sec
+    return None
+
+
+def _extract_answer_keys_from_text(text):
+    """从文末答案区提取题号->答案映射，支持分区（单选/多选/判断）。"""
+    lines = [l.strip() for l in str(text or '').split('\n') if l.strip()]
+    result = {
+        'single': {},
+        'multi': {},
+        'judge': {},
+        'blank': {},
+        'short': {},
+        'generic': {}
+    }
+
+    section = None
+    started = False
+    pair_re = re.compile(r'(\d{1,4})\s*[.、:：]\s*([A-HＡ-Ｈ]{1,8}|正确|错误|对|错)')
+
+    for line in lines:
+        # 进入答案区
+        if '参考答案' in line:
+            started = True
+
+        if not started:
+            continue
+
+        # 分区切换（如“单选题参考答案”）
+        if '单选' in line and '答案' in line:
+            section = 'single'
+            continue
+        if '多选' in line and '答案' in line:
+            section = 'multi'
+            continue
+        if '判断' in line and '答案' in line:
+            section = 'judge'
+            continue
+        if '填空' in line and '答案' in line:
+            section = 'blank'
+            continue
+        if '简答' in line and '答案' in line:
+            section = 'short'
+            continue
+
+        # 新题区标题出现时退出答案分区
+        sec_heading = _detect_section_heading(line)
+        if sec_heading and '答案' not in line:
+            section = None
+            continue
+
+        pairs = list(pair_re.finditer(line))
+        if not pairs:
+            continue
+
+        for m in pairs:
+            qno = int(m.group(1))
+            ans = _normalize_answer_text(m.group(2))
+            if section in result:
+                result[section][qno] = ans
+            result['generic'][qno] = ans
+
+    return result
+
+
+def _fill_answers_from_answer_keys(questions, answer_keys):
+    """把文末答案区映射回题目列表。"""
+    section_index = {'single': 0, 'multi': 0, 'judge': 0}
+
+    for q in questions:
+        options = q.get('options') or {}
+        if not options:
+            continue
+
+        # 已有答案则跳过
+        if q.get('answer'):
+            continue
+
+        section_hint = q.get('section_hint')
+        ans_token = ''
+
+        if section_hint in ('single', 'multi', 'judge'):
+            section_index[section_hint] += 1
+            ans_token = answer_keys.get(section_hint, {}).get(section_index[section_hint], '')
+
+        if not ans_token:
+            src_no = q.get('source_no')
+            if src_no is not None:
+                ans_token = answer_keys.get('generic', {}).get(src_no, '')
+
+        if not ans_token:
+            continue
+
+        letters = _extract_choice_answer(ans_token, options)
+        if not letters:
+            letters = re.findall(r'[A-H]', _normalize_answer_text(ans_token))
+
+        if letters:
+            q['answer'] = sorted(set(letters), key=letters.index)
+            if section_hint == 'multi':
+                q['type'] = 'multi'
+            elif section_hint == 'judge':
+                q['type'] = 'judge'
+            elif section_hint == 'single' and q.get('type') != 'judge':
+                q['type'] = 'single'
 
 # 宽松问答解析中，用于识别“无问号但明显是提问提示语”的行。
 QA_PROMPT_HINTS = (
@@ -487,6 +632,11 @@ def build_parse_candidates(filepath):
         if red_questions and styled_blanks:
             merged = _merge_docx_blank_questions(red_questions, styled_blanks)
             candidates.append(('红色客观 + 样式填空', merged, '客观题用红色，填空题用样式提取'))
+
+    if ext == '.pdf':
+        forced_judge = _coerce_no_option_questions_to_judge(auto_questions)
+        if forced_judge:
+            candidates.append(('强制判断题模式', forced_judge, '将无选项题按判断题处理（A=正确，B=错误）'))
 
     unique = []
     seen = set()
@@ -1336,6 +1486,14 @@ def _clean_answer_text(answer_text):
     return t.strip()
 
 
+def _is_answer_index_noise_line(text):
+    """判断是否为答案区常见的序号噪声行（如 1. / 23 / （4））。"""
+    t = str(text or '').strip()
+    if not t:
+        return False
+    return bool(re.fullmatch(r'[（(]?\d{1,4}[)）]?[.。]?', t))
+
+
 def _extract_choice_answer(answer_text, options):
     """尽量从答案文本中提取选项字母（支持 A/B/C、AB、A,C 等格式）。"""
     normalized = _normalize_answer_text(answer_text)
@@ -1410,16 +1568,53 @@ def _split_content_and_answer(lines):
             continue
 
         head = m.group(1).strip()
-        answer_lines = []
-        if head:
-            answer_lines.append(head)
-        if i + 1 < len(lines):
-            answer_lines.extend(l.strip() for l in lines[i + 1:] if l.strip())
+        tail_lines = [l.strip() for l in lines[i + 1:] if l.strip()]
+        content_lines = list(lines[:i])
 
-        answer_text = '\n'.join(answer_lines).strip()
-        content_lines = lines[:i]
-        if content_lines and answer_text:
-            return content_lines, answer_text
+        # 常规：答案与“答案：”同一行。
+        if head:
+            answer_lines = [head]
+            if tail_lines:
+                answer_lines.extend(tail_lines)
+            answer_text = '\n'.join(answer_lines).strip()
+            if content_lines and answer_text:
+                return content_lines, answer_text
+            continue
+
+        # 兼容 PDF："答案："后常混入题号噪声与正文续行，避免把续行吞成答案。
+        if not tail_lines:
+            continue
+
+        answer_idx = None
+        for j in range(len(tail_lines) - 1, -1, -1):
+            if _looks_like_answer_token(tail_lines[j]):
+                answer_idx = j
+                break
+
+        if answer_idx is not None:
+            for j, l in enumerate(tail_lines):
+                if j >= answer_idx:
+                    break
+                if _is_answer_index_noise_line(l):
+                    continue
+                if QUESTION_START_RE.match(l):
+                    continue
+                content_lines.append(l)
+
+            if content_lines:
+                return content_lines, tail_lines[answer_idx]
+            continue
+
+        # 未识别到明确答案：将非噪声续行并回题干，不返回答案。
+        for l in tail_lines:
+            if _is_answer_index_noise_line(l):
+                continue
+            if QUESTION_START_RE.match(l):
+                continue
+            content_lines.append(l)
+
+        if content_lines:
+            return content_lines, ''
 
     # 2) 无答案前缀时的启发式拆分
     # 2.1 客观题常见：最后一行为标准答案 token（不是选项行）
@@ -1574,6 +1769,177 @@ def _apply_pdf_known_blank_patterns(text):
 
     return None
 
+
+def _convert_text_to_judge_question(text):
+    """将末尾带“对/错”标记的文本转为判断题。"""
+    t = re.sub(r'\s+', ' ', str(text or '')).strip()
+    if not t:
+        return None
+
+    m = re.search(r'(对|错|正确|错误)\s*$', t)
+    if not m:
+        return None
+
+    token = m.group(1)
+    stem = t[:m.start()].strip(' ：:;；，,。')
+    if len(stem) < 6:
+        return None
+
+    answer = ['A'] if token in ('对', '正确') else ['B']
+    return {
+        'text': stem,
+        'options': {'A': '正确', 'B': '错误'},
+        'answer': answer,
+        'type': 'judge'
+    }
+
+
+def _extract_judge_token(text):
+    """从文本中提取判断题答案标记。"""
+    t = re.sub(r'\s+', '', str(text or ''))
+    if not t:
+        return ''
+
+    if re.fullmatch(r'(对|错|正确|错误)', t):
+        return '对' if t in ('对', '正确') else '错'
+
+    m = re.search(r'(对|错|正确|错误)', t)
+    if not m:
+        return ''
+    return '对' if m.group(1) in ('对', '正确') else '错'
+
+
+def _clean_pdf_judge_text_noise(text):
+    """清理 PDF 判断题题干中的编号噪声与拼接残片。"""
+    t = re.sub(r'\s+', ' ', str(text or '')).strip()
+    if not t:
+        return t
+
+    # 去掉夹在中文语句中的孤立编号（常见于“答案：xx”误混入题干）。
+    t = re.sub(r'(?<=[\u4e00-\u9fff，,、。；;：:])\s+\d{1,3}\s+(?=[\u4e00-\u9fff])', ' ', t)
+    # 去掉“对 54 在...”这类下一题起始拼接。
+    t = re.sub(r'\s*(?:对|错|正确|错误)\s+\d{1,3}\s+[\u4e00-\u9fff].*$', '', t)
+    t = re.sub(r'\s{2,}', ' ', t).strip(' .．。 ，,；;')
+    return t
+
+
+def _split_compound_placeholder_judge_questions(questions):
+    """把“（1）___ ... 对 （2）___ ... 错 ...”的大块题拆成多个判断题。"""
+    marker_re = re.compile(r'（\s*\d+\s*）\s*[_＿﹍]{2,}')
+    out = []
+
+    for q in questions:
+        q_type = q.get('type')
+        if q_type not in ('blank', 'short') or q.get('options'):
+            out.append(q)
+            continue
+
+        text = re.sub(r'\s+', ' ', str(q.get('text', '') or '')).strip()
+        markers = list(marker_re.finditer(text))
+        if len(markers) < 3:
+            out.append(q)
+            continue
+
+        split_items = []
+        for i, m in enumerate(markers):
+            start = m.end()
+            end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
+            seg = text[start:end].strip(' ；;，,。')
+            if not seg:
+                continue
+
+            ans_m = re.search(r'(对|错|正确|错误)\s*$', seg)
+            if not ans_m:
+                continue
+            token = ans_m.group(1)
+            stem = seg[:ans_m.start()].strip(' ：:;；，,。')
+            stem = _clean_pdf_judge_text_noise(stem)
+            if len(stem) < 8:
+                continue
+
+            split_items.append({
+                'id': 0,
+                'text': stem,
+                'options': {'A': '正确', 'B': '错误'},
+                'answer': ['A'] if token in ('对', '正确') else ['B'],
+                'type': 'judge'
+            })
+
+        if len(split_items) >= 3:
+            out.extend(split_items)
+        else:
+            out.append(q)
+
+    return out
+
+
+def _postprocess_pdf_to_judge(questions):
+    """PDF后处理：把“无选项+末尾对错”的短答转为判断题。"""
+    for q in questions:
+        if q.get('options'):
+            continue
+        if q.get('type') != 'short':
+            continue
+
+        q_text = re.sub(r'\s+', ' ', str(q.get('text', '') or '')).strip()
+        q_answer = re.sub(r'\s+', ' ', str(q.get('answer', '') or '')).strip()
+
+        # 先用题干本身判断，避免把“答案区数字”拼进题干。
+        converted = _convert_text_to_judge_question(q_text)
+        if not converted and q_answer and not _looks_like_answer_token(q_answer) and len(q_answer) >= 8:
+            converted = _convert_text_to_judge_question((q_text + ' ' + q_answer).strip())
+
+        if not converted:
+            token = _extract_judge_token(q.get('answer', ''))
+            if not token:
+                continue
+            converted = {
+                'text': q_text,
+                'options': {'A': '正确', 'B': '错误'},
+                'answer': ['A'] if token == '对' else ['B'],
+                'type': 'judge'
+            }
+
+        q['text'] = _clean_pdf_judge_text_noise(converted['text'])
+        q['options'] = converted['options']
+        q['answer'] = converted['answer']
+        q['type'] = converted['type']
+
+
+def _coerce_no_option_questions_to_judge(questions):
+    """强制模式：把无选项题统一转为判断题（答案尽量从文本中提取）。"""
+    out = []
+    for q in questions:
+        copied = dict(q)
+        if copied.get('options'):
+            out.append(copied)
+            continue
+
+        q_text = re.sub(r'\s+', ' ', str(copied.get('text', '') or '')).strip()
+        q_answer = re.sub(r'\s+', ' ', str(copied.get('answer', '') or '')).strip()
+
+        converted = _convert_text_to_judge_question(q_text)
+        if not converted and q_answer and not _looks_like_answer_token(q_answer) and len(q_answer) >= 8:
+            converted = _convert_text_to_judge_question((q_text + ' ' + q_answer).strip())
+
+        if converted:
+            copied['text'] = _clean_pdf_judge_text_noise(converted['text'])
+            copied['options'] = converted['options']
+            copied['answer'] = converted['answer']
+            copied['type'] = converted['type']
+        else:
+            token = _extract_judge_token(copied.get('answer', ''))
+            copied['text'] = _clean_pdf_judge_text_noise(copied.get('text', ''))
+            copied['options'] = {'A': '正确', 'B': '错误'}
+            copied['answer'] = ['A'] if token == '对' else (['B'] if token == '错' else [])
+            copied['type'] = 'judge'
+
+        out.append(copied)
+
+    for i, q in enumerate(out, 1):
+        q['id'] = i
+    return out
+
 def parse_questions(filepath):
     """解析题库文件，提取所有题目、选项、正确答案（支持 txt/pdf/doc/docx）。"""
     ext = os.path.splitext(filepath)[1].lower()
@@ -1601,32 +1967,49 @@ def parse_questions(filepath):
     current_block = []
     blocks = []
     has_question_boundary = False
+    current_section = None
 
     for line in lines:
+        sec = _detect_section_heading(line.strip())
+        if sec:
+            current_section = sec
+            continue
+
         if QUESTION_START_RE.match(line.strip()):
             has_question_boundary = True
             if current_block and any(l.strip() for l in current_block):
-                blocks.append('\n'.join(current_block).strip())
+                blocks.append(('\n'.join(current_block).strip(), current_section))
                 current_block = []
         current_block.append(line)
 
     if current_block and any(l.strip() for l in current_block):
-        blocks.append('\n'.join(current_block).strip())
+        blocks.append(('\n'.join(current_block).strip(), current_section))
 
     # 如果按题号分块失败，则退化为按答案行分块。
     if not has_question_boundary:
         current_block = []
         blocks = []
+        current_section = None
         for line in lines:
+            sec = _detect_section_heading(line.strip())
+            if sec:
+                current_section = sec
+                continue
+
             current_block.append(line)
             if ANSWER_LABEL_RE.match(line.strip()):
-                blocks.append('\n'.join(current_block).strip())
+                blocks.append(('\n'.join(current_block).strip(), current_section))
                 current_block = []
 
-    for block in blocks:
+    for block, section_hint in blocks:
         q = parse_single_block(block)
         if q:
+            if section_hint:
+                q['section_hint'] = section_hint
             questions.append(q)
+
+    answer_keys = _extract_answer_keys_from_text(text)
+    _fill_answers_from_answer_keys(questions, answer_keys)
 
     # 低命中时回退到“编号简答”与“宽松问答”抽取，覆盖 txt/doc/docx/pdf 简答场景。
     if ext in ('.txt', '.pdf', '.doc', '.docx'):
@@ -1696,6 +2079,12 @@ def parse_questions(filepath):
                     else:
                         q['answer'] = '（2）应当取消预备党员资格'
 
+        _postprocess_pdf_to_judge(questions)
+        questions = _split_compound_placeholder_judge_questions(questions)
+        for q in questions:
+            if q.get('type') == 'judge':
+                q['text'] = _clean_pdf_judge_text_noise(q.get('text', ''))
+
     # 重新编号
     for q in questions:
         if q.get('type') == 'short':
@@ -1715,6 +2104,11 @@ def parse_single_block(block):
     lines = [l.strip() for l in block.strip().split('\n') if l.strip()]
     if not lines:
         return None
+
+    source_no = None
+    m_no = re.match(r'^\s*(\d{1,4})\s*[.、．\)]', lines[0])
+    if m_no:
+        source_no = int(m_no.group(1))
 
     content_lines, answer_text = _split_content_and_answer(lines)
     if not content_lines:
@@ -1741,6 +2135,7 @@ def parse_single_block(block):
 
     options = {}
     option_positions = []
+    format_marked_letters = []
 
     for m in option_pattern.finditer(full_text):
         option_positions.append((m.group(1), m.start(), m.end()))
@@ -1772,17 +2167,24 @@ def parse_single_block(block):
                 opt_text = full_text[end:next_start].strip()
             else:
                 opt_text = full_text[end:].strip()
+
+            # 识别“选项字母前”的勾选标记（如：B、）。
+            pre_context = full_text[max(0, start - 3):start]
+            if _option_contains_answer_marker(pre_context):
+                format_marked_letters.append(letter)
+
             # 清理选项文本
             opt_text = opt_text.replace('\n', ' ').strip()
             # 去掉末尾的标点
             opt_text = opt_text.rstrip('。.，,')
-            options[letter] = opt_text
+            options[letter] = _clean_option_text(opt_text)
     else:
         # 主观题：没有选项，整个内容就是题干
         question_text = full_text.strip()
 
     # 清理题目文本
     question_text = question_text.replace('\n', ' ')
+    question_text = re.sub(r'[\uf0b7\u2022]+', ' ', question_text)
     # 移除开头的编号
     question_text = re.sub(r'^[\d]+[.、．\s]+', '', question_text)
     # 移除 【单选题】【多选题】 等标签
@@ -1802,6 +2204,12 @@ def parse_single_block(block):
     if options:
         # 关键修复：只要有选项，就按客观题判型，不再降级成简答/填空。
         correct_answers = _extract_choice_answer(answer_text or '', options)
+        if not correct_answers:
+            # PDF/文档中常见：正确项用“勾选符号”直接标在选项行。
+            if format_marked_letters:
+                correct_answers = sorted(set(format_marked_letters), key=format_marked_letters.index)
+            else:
+                correct_answers = _extract_choice_answer_from_option_format(options)
         if _is_judge_options(options):
             q_type = 'judge'
         elif len(correct_answers) > 1:
@@ -1825,13 +2233,441 @@ def parse_single_block(block):
         'text': question_text,
         'options': options,
         'answer': answer_value,
-        'type': q_type
+        'type': q_type,
+        'source_no': source_no
     }
 
 
 # ============ 错误记录模块 ============
 
-RECORD_FILE = 'error_record.json'
+APP_NAME = 'SuperReciteHelper'
+
+
+def _get_app_storage_dir():
+    """获取可执行程序友好的持久化目录。"""
+    if os.name == 'nt':
+        base = os.getenv('APPDATA') or os.path.expanduser('~')
+    else:
+        base = os.path.join(os.path.expanduser('~'), '.local', 'share')
+
+    path = os.path.join(base, APP_NAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+APP_STORAGE_DIR = _get_app_storage_dir()
+RECORD_FILE = os.path.join(APP_STORAGE_DIR, 'error_record.json')
+STATE_FILE = os.path.join(APP_STORAGE_DIR, 'app_state.json')
+QUESTION_EDITS_FILE = os.path.join(APP_STORAGE_DIR, 'question_edits.json')
+
+
+def load_app_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return {}
+
+
+def save_app_state(state):
+    try:
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state or {}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def load_manual_question_edits():
+    if os.path.exists(QUESTION_EDITS_FILE):
+        try:
+            with open(QUESTION_EDITS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return {}
+
+
+def save_manual_question_edits(edits):
+    try:
+        with open(QUESTION_EDITS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(edits or {}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _format_answer_text(answer_value):
+    if isinstance(answer_value, list):
+        return ''.join(answer_value)
+    return str(answer_value or '')
+
+
+def _ensure_question_identity_fields(question):
+    """确保题目具备稳定键与原始内容快照。"""
+    if '_base_key' not in question or not question.get('_base_key'):
+        question['_base_key'] = _build_question_record_key(question)
+    if '_record_key' not in question or not question.get('_record_key'):
+        question['_record_key'] = question['_base_key']
+
+    if '_orig_text' not in question:
+        question['_orig_text'] = str(question.get('text', '') or '')
+    if '_orig_answer' not in question:
+        if isinstance(question.get('answer'), list):
+            question['_orig_answer'] = list(question.get('answer', []))
+        else:
+            question['_orig_answer'] = str(question.get('answer', '') or '')
+    if '_orig_type' not in question:
+        question['_orig_type'] = str(question.get('type', '') or '')
+    if '_orig_options' not in question:
+        src_options = question.get('options') or {}
+        question['_orig_options'] = dict(src_options)
+
+
+def _parse_manual_answer_for_question(question, raw_text, target_type=None, options_override=None):
+    """按题型校验并解析手动输入答案。"""
+    q_type = target_type or question.get('type')
+    text = str(raw_text or '').strip()
+
+    if q_type in ('blank', 'short'):
+        if not text:
+            return None, '主观题答案不能为空。'
+        return text, None
+
+    options = options_override if options_override is not None else (question.get('options') or {})
+    valid_keys = sorted(options.keys())
+    if not valid_keys:
+        return None, '该题没有可用选项，无法按客观题规则修改。'
+
+    letters = []
+    normalized = _normalize_answer_text(text)
+    for ch in re.findall(r'[A-H]', normalized):
+        if ch in valid_keys and ch not in letters:
+            letters.append(ch)
+
+    if not letters:
+        inferred = _extract_choice_answer(text, options)
+        for ch in inferred:
+            if ch in valid_keys and ch not in letters:
+                letters.append(ch)
+
+    if q_type in ('single', 'judge'):
+        if len(letters) != 1:
+            label = '判断' if q_type == 'judge' else '单选'
+            return None, f'该题为{label}题，请输入 1 个选项字母（如 A）。'
+        return letters, None
+
+    if q_type == 'multi':
+        if not letters:
+            return None, '多选题请输入至少 1 个选项字母（如 AC）。'
+        return letters, None
+
+    return None, '暂不支持该题型的答案编辑。'
+
+
+def _format_options_for_edit(options):
+    opt = options or {}
+    lines = []
+    for k in sorted(opt.keys()):
+        lines.append(f'{k}: {opt.get(k, "")}')
+    return '\n'.join(lines)
+
+
+def _parse_manual_options_text(raw_text):
+    """解析手动输入的选项文本，格式示例：A: xxx"""
+    lines = [l.strip() for l in str(raw_text or '').splitlines() if l.strip()]
+    if not lines:
+        return {}, '请先输入选项，格式如：A: 选项内容'
+
+    out = {}
+    for line in lines:
+        m = re.match(r'^([A-HＡ-Ｈ])\s*[.、．:：\)）\-]?\s*(.*)$', line)
+        if not m:
+            return {}, f'选项格式错误：{line}（示例：A: 选项内容）'
+        letter = m.group(1).translate(str.maketrans('ＡＢＣＤＥＦＧＨ', 'ABCDEFGH'))
+        text = m.group(2).strip()
+        if not text:
+            return {}, f'选项 {letter} 内容不能为空。'
+        out[letter] = text
+
+    if len(out) < 2:
+        return {}, '客观题至少需要 2 个选项。'
+
+    return dict(sorted(out.items())), None
+
+
+def _show_question_edit_dialog(parent, question, title='编辑题目与答案'):
+    """多行编辑弹窗：适合长题干。"""
+    q = question or {}
+    q_type = str(q.get('type', '') or '')
+    type_map = {
+        'single': '单选',
+        'multi': '多选',
+        'judge': '判断',
+        'blank': '填空',
+        'short': '简答'
+    }
+    label_to_type = {v: k for k, v in type_map.items()}
+    type_text = type_map.get(q_type, str(q_type))
+
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.transient(parent)
+    win.grab_set()
+
+    p_w = parent.winfo_width() if parent.winfo_width() > 1 else 1200
+    p_h = parent.winfo_height() if parent.winfo_height() > 1 else 800
+    p_x = parent.winfo_x()
+    p_y = parent.winfo_y()
+
+    win_w = max(780, int(p_w * 0.78))
+    win_h = max(560, int(p_h * 0.78))
+    x = p_x + max(0, (p_w - win_w) // 2)
+    y = p_y + max(0, (p_h - win_h) // 2)
+    win.geometry(f'{win_w}x{win_h}+{x}+{y}')
+    win.configure(bg='#f5f5f5')
+
+    info = tk.Label(
+        win,
+        text=f'题号：{q.get("id", "")}  |  题型：{type_text}',
+        bg='#2c3e50', fg='white', anchor='w',
+        font=('Microsoft YaHei', 10)
+    )
+    info.pack(fill='x', padx=0, pady=0, ipady=10)
+
+    type_wrap = tk.Frame(win, bg='#f5f5f5')
+    type_wrap.pack(fill='x', padx=12, pady=(10, 0))
+    tk.Label(type_wrap, text='题型：', bg='#f5f5f5', fg='#2c3e50').pack(side='left')
+    type_var = tk.StringVar(value=type_map.get(q_type, '简答'))
+    type_combo = ttk.Combobox(
+        type_wrap,
+        state='readonly',
+        textvariable=type_var,
+        values=[type_map[k] for k in ('single', 'multi', 'judge', 'blank', 'short')],
+        width=12
+    )
+    type_combo.pack(side='left', padx=(6, 0))
+
+    content = tk.Frame(win, bg='#f5f5f5')
+    content.pack(fill='both', expand=True, padx=12, pady=10)
+
+    tk.Label(content, text='题目文本（可多行）：', bg='#f5f5f5', fg='#2c3e50', anchor='w').pack(fill='x')
+    q_text_box = tk.Text(content, height=11, wrap='word', font=('Microsoft YaHei', 10), relief='groove', bd=1)
+    q_scroll = ttk.Scrollbar(content, orient='vertical', command=q_text_box.yview)
+    q_text_box.configure(yscrollcommand=q_scroll.set)
+    q_text_box.pack(side='left', fill='both', expand=True, pady=(4, 10))
+    q_scroll.pack(side='left', fill='y', pady=(4, 10))
+    q_text_box.insert('1.0', str(q.get('text', '') or ''))
+
+    ans_wrap = tk.Frame(win, bg='#f5f5f5')
+    ans_wrap.pack(fill='both', padx=12, pady=(0, 8))
+
+    answer_hint_var = tk.StringVar(value='答案：')
+    tk.Label(ans_wrap, textvariable=answer_hint_var, bg='#f5f5f5', fg='#2c3e50', anchor='w').pack(fill='x')
+    ans_text_box = tk.Text(ans_wrap, height=4, wrap='word', font=('Microsoft YaHei', 10), relief='groove', bd=1)
+    ans_scroll = ttk.Scrollbar(ans_wrap, orient='vertical', command=ans_text_box.yview)
+    ans_text_box.configure(yscrollcommand=ans_scroll.set)
+    ans_text_box.pack(side='left', fill='both', expand=True, pady=(4, 0))
+    ans_scroll.pack(side='left', fill='y', pady=(4, 0))
+    ans_text_box.insert('1.0', _format_answer_text(q.get('answer')))
+
+    opt_wrap = tk.Frame(win, bg='#f5f5f5')
+    opt_wrap.pack(fill='both', padx=12, pady=(0, 8))
+    options_title_var = tk.StringVar(value='选项（仅客观题需要，可多行）：')
+    tk.Label(opt_wrap, textvariable=options_title_var, bg='#f5f5f5', fg='#2c3e50', anchor='w').pack(fill='x')
+    opt_text_box = tk.Text(opt_wrap, height=5, wrap='word', font=('Microsoft YaHei', 10), relief='groove', bd=1)
+    opt_scroll = ttk.Scrollbar(opt_wrap, orient='vertical', command=opt_text_box.yview)
+    opt_text_box.configure(yscrollcommand=opt_scroll.set)
+    opt_text_box.pack(side='left', fill='both', expand=True, pady=(4, 0))
+    opt_scroll.pack(side='left', fill='y', pady=(4, 0))
+    opt_text_box.insert('1.0', _format_options_for_edit(q.get('options') or {}))
+
+    options_hint_var = tk.StringVar(value='')
+    options_label = tk.Label(
+        win,
+        textvariable=options_hint_var,
+        bg='#f5f5f5', fg='#7f8c8d', anchor='w',
+        font=('Microsoft YaHei', 9)
+    )
+    options_label.pack(fill='x', padx=12, pady=(0, 8))
+
+    result = {'ok': False, 'text': '', 'answer': None, 'type': q_type, 'options': dict(q.get('options') or {})}
+
+    def _resolve_target_options(target_type):
+        src = dict(q.get('options') or {})
+        if target_type == 'judge':
+            return {'A': '正确', 'B': '错误'}
+        if target_type in ('single', 'multi'):
+            return src
+        return {}
+
+    def _refresh_type_hints(_event=None):
+        target_type = label_to_type.get(type_var.get(), q_type)
+        if target_type in ('single', 'judge'):
+            answer_hint_var.set('答案（输入 1 个选项字母，如 A）：')
+        elif target_type == 'multi':
+            answer_hint_var.set('答案（输入多选字母，如 AC）：')
+        else:
+            answer_hint_var.set('答案：')
+
+        opt = _resolve_target_options(target_type)
+        if target_type in ('single', 'multi', 'judge'):
+            if opt:
+                opt_txt = '  '.join(f'{k}:{opt.get(k, "")}' for k in sorted(opt.keys()))
+                options_hint_var.set(f'可选项：{opt_txt}')
+            else:
+                options_hint_var.set('当前题无选项，请在下方“选项”框手动录入（如 A: xxx）。')
+        else:
+            options_hint_var.set('')
+
+        if target_type in ('single', 'multi', 'judge'):
+            options_title_var.set('选项（客观题必填，多行，示例：A: 选项内容）：')
+            opt_text_box.config(state='normal')
+        else:
+            options_title_var.set('选项（当前题型不需要）：')
+            opt_text_box.config(state='disabled')
+
+    type_combo.bind('<<ComboboxSelected>>', _refresh_type_hints)
+    _refresh_type_hints()
+
+    def on_save():
+        new_question_text = q_text_box.get('1.0', 'end').strip()
+        if not new_question_text:
+            messagebox.showerror('格式错误', '题目文本不能为空。', parent=win)
+            return
+
+        target_type = label_to_type.get(type_var.get(), q_type)
+        if target_type == 'judge':
+            target_options = {'A': '正确', 'B': '错误'}
+        elif target_type in ('single', 'multi'):
+            opt_raw = opt_text_box.get('1.0', 'end').strip()
+            target_options, opt_err = _parse_manual_options_text(opt_raw)
+            if opt_err:
+                messagebox.showerror('格式错误', opt_err, parent=win)
+                return
+        else:
+            target_options = {}
+
+        new_answer_raw = ans_text_box.get('1.0', 'end').strip()
+        parsed_answer, err = _parse_manual_answer_for_question(
+            q,
+            new_answer_raw,
+            target_type=target_type,
+            options_override=target_options
+        )
+        if err:
+            messagebox.showerror('格式错误', err, parent=win)
+            return
+
+        result['ok'] = True
+        result['text'] = new_question_text
+        result['answer'] = parsed_answer
+        result['type'] = target_type
+        result['options'] = target_options
+        win.destroy()
+
+    def on_cancel():
+        win.destroy()
+
+    btn_bar = tk.Frame(win, bg='#f5f5f5')
+    btn_bar.pack(fill='x', padx=12, pady=(0, 12))
+
+    tk.Button(
+        btn_bar, text='取消',
+        bg='#e0e0e0', fg='#2c3e50',
+        relief='flat', padx=14, pady=6,
+        command=on_cancel
+    ).pack(side='right', padx=(8, 0))
+
+    tk.Button(
+        btn_bar, text='保存修改',
+        bg='#2ecc71', fg='white', activebackground='#27ae60',
+        relief='flat', padx=14, pady=6,
+        command=on_save
+    ).pack(side='right')
+
+    win.protocol('WM_DELETE_WINDOW', on_cancel)
+    parent.wait_window(win)
+
+    if result['ok']:
+        return result['text'], result['answer'], result['type'], result['options']
+    return None
+
+
+def apply_manual_question_edits(questions, edits):
+    """将持久化编辑应用到当前题集（严格按 base_key 匹配）。"""
+    for q in questions:
+        _ensure_question_identity_fields(q)
+        base_key = q.get('_base_key')
+        if not base_key or base_key not in edits:
+            continue
+
+        payload = edits.get(base_key) or {}
+        if 'type' in payload and payload.get('type'):
+            q['type'] = str(payload.get('type'))
+        if 'options' in payload and isinstance(payload.get('options'), dict):
+            q['options'] = dict(payload.get('options') or {})
+        if 'text' in payload:
+            q['text'] = str(payload.get('text', '') or '')
+        if 'answer' in payload:
+            q['answer'] = payload.get('answer')
+
+
+def upsert_manual_question_edit(edits, question):
+    """写入某题的手动修改（以原始 base_key 为主键）。"""
+    _ensure_question_identity_fields(question)
+    key = question['_base_key']
+
+    payload = {
+        'type': question.get('type', ''),
+        'options': dict(question.get('options') or {}),
+        'text': str(question.get('text', '') or ''),
+        'answer': question.get('answer'),
+        'orig_type': question.get('_orig_type', ''),
+        'orig_options': dict(question.get('_orig_options') or {}),
+        'orig_text': str(question.get('_orig_text', '') or ''),
+        'orig_answer': question.get('_orig_answer', ''),
+        'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'preview': str(question.get('text', '') or '').replace('\n', ' ').strip()[:80]
+    }
+    edits[key] = payload
+    save_manual_question_edits(edits)
+    return key
+
+
+def _build_question_record_key(question):
+    """生成稳定题目键：跨会话/跨题号可复用。"""
+    q = question or {}
+    text = re.sub(r'\s+', '', str(q.get('text', '') or ''))
+    text = re.sub(r'[_＿﹍]+', '_', text)
+
+    options = q.get('options') or {}
+    option_items = []
+    for k in sorted(options.keys()):
+        v = re.sub(r'\s+', '', str(options.get(k, '') or ''))
+        option_items.append(f'{k}:{v}')
+
+    payload = {
+        'type': str(q.get('type', '') or ''),
+        'text': text,
+        'options': option_items,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha1(raw.encode('utf-8')).hexdigest()
+    return f'q:{digest}'
+
+
+def _record_key(q_or_id):
+    if isinstance(q_or_id, dict):
+        key = q_or_id.get('_record_key')
+        if key:
+            return key
+        return _build_question_record_key(q_or_id)
+    return str(q_or_id)
 
 
 def load_records():
@@ -1839,6 +2675,18 @@ def load_records():
     if os.path.exists(RECORD_FILE):
         with open(RECORD_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
+
+    # 兼容旧版本：首次升级时迁移脚本目录下的记录文件。
+    legacy_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'error_record.json')
+    if os.path.exists(legacy_file):
+        try:
+            with open(legacy_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                save_records(data)
+                return data
+        except Exception:
+            pass
     return {}
 
 
@@ -1850,15 +2698,22 @@ def save_records(records):
 
 def get_record(records, qid):
     """获取某题的记录"""
-    key = str(qid)
+    key = _record_key(qid)
     if key in records:
         return records[key]
+
+    # 兼容历史版本（按题号存储）
+    if isinstance(qid, dict):
+        legacy_id = qid.get('id')
+        if legacy_id is not None and str(legacy_id) in records:
+            return records[str(legacy_id)]
+
     return {'attempts': 0, 'errors': 0}
 
 
 def update_record(records, qid, is_correct):
     """更新某题的记录"""
-    key = str(qid)
+    key = _record_key(qid)
     if key not in records:
         records[key] = {'attempts': 0, 'errors': 0}
     records[key]['attempts'] += 1
@@ -1873,7 +2728,7 @@ def weighted_random_pick(questions, records):
     """根据错误次数和错误率进行加权随机抽题"""
     weights = []
     for q in questions:
-        rec = get_record(records, q['id'])
+        rec = get_record(records, q)
         attempts = rec['attempts']
         errors = rec['errors']
         error_rate = errors / attempts if attempts > 0 else 0
@@ -1921,6 +2776,10 @@ class QuizApp:
     def __init__(self, root, questions, source_path=''):
         self.root = root
         self.questions = questions
+        self.manual_edits = load_manual_question_edits()
+        for q in self.questions:
+            _ensure_question_identity_fields(q)
+        apply_manual_question_edits(self.questions, self.manual_edits)
         self.question_map = {q['id']: q for q in questions}
         # 兼容单文件字符串与多文件显示标签。
         self.source_path = source_path
@@ -2071,28 +2930,33 @@ class QuizApp:
         )
         self.history_label.pack(fill='x', pady=(0, 5))
 
-        # 底部按钮栏
-        btn_frame = tk.Frame(self.root, bg='#ecf0f1', height=60)
+        # 底部按钮栏（双行布局，避免高 DPI 或窄窗口下按钮被挤扁/截断）
+        btn_frame = tk.Frame(self.root, bg='#ecf0f1')
         btn_frame.pack(fill='x', side='bottom')
-        btn_frame.pack_propagate(False)
+
+        action_row = tk.Frame(btn_frame, bg='#ecf0f1')
+        action_row.pack(fill='x', padx=10, pady=(8, 2))
+
+        utility_row = tk.Frame(btn_frame, bg='#ecf0f1')
+        utility_row.pack(fill='x', padx=10, pady=(0, 8))
 
         self.submit_btn = tk.Button(
-            btn_frame, text="提交答案", font=self.btn_font,
+            action_row, text="提交答案", font=self.btn_font,
             bg='#3498db', fg='white', activebackground='#2980b9',
             relief='flat', padx=20, pady=8, command=self.submit_answer
         )
-        self.submit_btn.pack(side='left', padx=20, pady=10)
+        self.submit_btn.pack(side='left', padx=(10, 8), pady=2)
 
         self.next_btn = tk.Button(
-            btn_frame, text="下一题 ▶", font=self.btn_font,
+            action_row, text="下一题 ▶", font=self.btn_font,
             bg='#2ecc71', fg='white', activebackground='#27ae60',
             relief='flat', padx=20, pady=8, command=self.next_question
         )
-        self.next_btn.pack(side='left', padx=5, pady=10)
+        self.next_btn.pack(side='left', padx=(0, 8), pady=2)
 
         # 键盘输入区：支持 ABC 选项输入与 t/f 主观自评。
-        input_frame = tk.Frame(btn_frame, bg='#ecf0f1')
-        input_frame.pack(side='left', padx=(12, 0), pady=10)
+        input_frame = tk.Frame(action_row, bg='#ecf0f1')
+        input_frame.pack(side='left', padx=(8, 0), pady=2)
 
         self.keyboard_hint_label = tk.Label(
             input_frame,
@@ -2114,18 +2978,32 @@ class QuizApp:
         self.keyboard_entry.bind('<Return>', self._on_entry_enter)
 
         self.reset_btn = tk.Button(
-            btn_frame, text="重置记录", font=self.small_font,
+            utility_row, text="重置记录", font=self.small_font,
             bg='#e74c3c', fg='white', activebackground='#c0392b',
             relief='flat', padx=10, pady=5, command=self.reset_records
         )
-        self.reset_btn.pack(side='right', padx=20, pady=10)
+        self.reset_btn.pack(side='right', padx=(8, 0), pady=2)
+
+        self.manage_edits_btn = tk.Button(
+            utility_row, text="管理题目修改", font=self.small_font,
+            bg='#16a085', fg='white', activebackground='#138d75',
+            relief='flat', padx=10, pady=5, command=self.manage_manual_edits
+        )
+        self.manage_edits_btn.pack(side='right', padx=(8, 0), pady=2)
+
+        self.edit_current_btn = tk.Button(
+            utility_row, text="编辑当前题", font=self.small_font,
+            bg='#f39c12', fg='white', activebackground='#d68910',
+            relief='flat', padx=10, pady=5, command=self.edit_current_question
+        )
+        self.edit_current_btn.pack(side='right', padx=(8, 0), pady=2)
 
         self.freq_btn = tk.Button(
-            btn_frame, text="考频统计", font=self.small_font,
+            utility_row, text="考频统计", font=self.small_font,
             bg='#8e44ad', fg='white', activebackground='#7d3c98',
             relief='flat', padx=10, pady=5, command=self.show_frequency_stats
         )
-        self.freq_btn.pack(side='right', padx=(0, 8), pady=10)
+        self.freq_btn.pack(side='right', padx=(8, 0), pady=2)
 
     def _on_canvas_configure(self, event):
         self.canvas.itemconfig(self.canvas_window, width=event.width)
@@ -2229,7 +3107,7 @@ class QuizApp:
         self.result_label.config(text="")
 
         # 显示历史记录
-        rec = get_record(self.records, q['id'])
+        rec = get_record(self.records, q)
         if rec['attempts'] > 0:
             rate = rec['errors'] / rec['attempts'] * 100
             self.history_label.config(
@@ -2361,7 +3239,7 @@ class QuizApp:
         is_correct = self.selected == correct
 
         # 更新记录
-        update_record(self.records, q['id'], is_correct)
+        update_record(self.records, q, is_correct)
         self.update_stats()
 
         # 高亮显示正确/错误选项
@@ -2384,7 +3262,7 @@ class QuizApp:
             )
 
         # 更新历史显示
-        rec = get_record(self.records, q['id'])
+        rec = get_record(self.records, q)
         rate = rec['errors'] / rec['attempts'] * 100
         self.history_label.config(
             text=f"历史记录：答过 {rec['attempts']} 次，错误 {rec['errors']} 次，错误率 {rate:.0f}%"
@@ -2400,7 +3278,7 @@ class QuizApp:
         self.submitted = True
         q = self.current_q
 
-        update_record(self.records, q['id'], is_correct)
+        update_record(self.records, q, is_correct)
         self.update_stats()
 
         for btn in self.judge_buttons:
@@ -2417,7 +3295,7 @@ class QuizApp:
                 fg='#e74c3c'
             )
 
-        rec = get_record(self.records, q['id'])
+        rec = get_record(self.records, q)
         rate = rec['errors'] / rec['attempts'] * 100
         self.history_label.config(
             text=f"历史记录：答过 {rec['attempts']} 次，错误 {rec['errors']} 次，错误率 {rate:.0f}%"
@@ -2432,6 +3310,178 @@ class QuizApp:
             save_records(self.records)
             self.update_stats()
             messagebox.showinfo("完成", "所有记录已重置。")
+
+    def _ask_edit_question_and_answer(self, q):
+        """弹窗编辑题干与答案。"""
+        edited = _show_question_edit_dialog(self.root, q, title='编辑当前题（题目+答案）')
+        if not edited:
+            return False
+
+        new_text, parsed_answer, new_type, new_options = edited
+        q['text'] = new_text
+        q['answer'] = parsed_answer
+        q['type'] = new_type
+        q['options'] = dict(new_options or {})
+        upsert_manual_question_edit(self.manual_edits, q)
+        return True
+
+    def edit_current_question(self):
+        if not self.current_q:
+            messagebox.showwarning('提示', '请先点击“下一题”抽取题目。', parent=self.root)
+            return
+
+        if not self._ask_edit_question_and_answer(self.current_q):
+            return
+
+        # 编辑后重置提交状态并刷新展示
+        self.submitted = False
+        self.answer_revealed = False
+        self.selected = set()
+        self.display_question()
+        messagebox.showinfo('完成', '当前题修改已保存，下次启动仍会生效。', parent=self.root)
+
+    def manage_manual_edits(self):
+        win = tk.Toplevel(self.root)
+        win.title('管理题目修改')
+        win_w = max(900, int(self.root.winfo_width() * 0.88))
+        win_h = max(520, int(self.root.winfo_height() * 0.72))
+        x = self.root.winfo_x() + max(0, (self.root.winfo_width() - win_w) // 2)
+        y = self.root.winfo_y() + max(0, (self.root.winfo_height() - win_h) // 2)
+        win.geometry(f'{win_w}x{win_h}+{x}+{y}')
+        win.configure(bg='#f5f5f5')
+        win.transient(self.root)
+
+        top = tk.Frame(win, bg='#2c3e50', height=52)
+        top.pack(fill='x')
+        top.pack_propagate(False)
+
+        title_label = tk.Label(
+            top,
+            text=f'已保存修改：{len(self.manual_edits)} 项',
+            font=self.small_font,
+            fg='white',
+            bg='#2c3e50',
+            anchor='w'
+        )
+        title_label.pack(fill='x', padx=12, pady=14)
+
+        body = tk.Frame(win, bg='#f5f5f5')
+        body.pack(fill='both', expand=True, padx=12, pady=10)
+
+        columns = ('no', 'type', 'answer', 'updated_at', 'preview')
+        tree = ttk.Treeview(body, columns=columns, show='headings')
+        tree.heading('no', text='序号')
+        tree.heading('type', text='题型')
+        tree.heading('answer', text='答案')
+        tree.heading('updated_at', text='更新时间')
+        tree.heading('preview', text='题干预览')
+        tree.column('no', width=60, anchor='center')
+        tree.column('type', width=70, anchor='center')
+        tree.column('answer', width=120, anchor='w')
+        tree.column('updated_at', width=140, anchor='center')
+        tree.column('preview', width=620, anchor='w')
+
+        yscroll = ttk.Scrollbar(body, orient='vertical', command=tree.yview)
+        xscroll = ttk.Scrollbar(body, orient='horizontal', command=tree.xview)
+        tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
+        tree.grid(row=0, column=0, sticky='nsew')
+        yscroll.grid(row=0, column=1, sticky='ns')
+        xscroll.grid(row=1, column=0, sticky='ew')
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        def refresh_table():
+            for item in tree.get_children():
+                tree.delete(item)
+
+            for i, (k, v) in enumerate(sorted(self.manual_edits.items(), key=lambda x: str(x[1].get('updated_at', '')), reverse=True), 1):
+                ans = _format_answer_text(v.get('answer', ''))
+                preview = str(v.get('preview', '') or '')
+                tree.insert('', 'end', iid=k, values=(
+                    i,
+                    v.get('type', ''),
+                    (ans[:22] + '...') if len(ans) > 22 else ans,
+                    v.get('updated_at', ''),
+                    preview
+                ))
+            title_label.config(text=f'已保存修改：{len(self.manual_edits)} 项')
+
+        btn_bar = tk.Frame(win, bg='#f5f5f5')
+        btn_bar.pack(fill='x', padx=12, pady=(0, 12))
+
+        def restore_selected():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning('提示', '请先选择一条修改记录。', parent=win)
+                return
+
+            key = selected[0]
+            payload = self.manual_edits.get(key)
+            if not payload:
+                return
+
+            if not messagebox.askyesno('确认', '确定恢复该题为默认解析结果吗？', parent=win):
+                return
+
+            del self.manual_edits[key]
+            save_manual_question_edits(self.manual_edits)
+
+            for q in self.questions:
+                _ensure_question_identity_fields(q)
+                if q.get('_base_key') == key:
+                    q['type'] = str(payload.get('orig_type', q.get('_orig_type', q.get('type', ''))))
+                    q['options'] = dict(payload.get('orig_options', q.get('_orig_options', q.get('options', {}))) or {})
+                    q['text'] = str(payload.get('orig_text', q.get('_orig_text', q.get('text', ''))))
+                    q['answer'] = payload.get('orig_answer', q.get('_orig_answer', q.get('answer', '')))
+            if self.current_q and self.current_q.get('_base_key') == key:
+                self.display_question()
+
+            refresh_table()
+
+        def clear_all():
+            if not self.manual_edits:
+                messagebox.showinfo('提示', '当前没有可清空的修改。', parent=win)
+                return
+            if not messagebox.askyesno('确认', '确定清空全部题目修改吗？\n该操作不可撤销。', parent=win):
+                return
+
+            deleted = dict(self.manual_edits)
+            self.manual_edits = {}
+            save_manual_question_edits(self.manual_edits)
+
+            for q in self.questions:
+                _ensure_question_identity_fields(q)
+                key = q.get('_base_key')
+                if key in deleted:
+                    payload = deleted[key]
+                    q['type'] = str(payload.get('orig_type', q.get('_orig_type', q.get('type', ''))))
+                    q['options'] = dict(payload.get('orig_options', q.get('_orig_options', q.get('options', {}))) or {})
+                    q['text'] = str(payload.get('orig_text', q.get('_orig_text', q.get('text', ''))))
+                    q['answer'] = payload.get('orig_answer', q.get('_orig_answer', q.get('answer', '')))
+
+            if self.current_q:
+                self.display_question()
+
+            refresh_table()
+
+        tk.Button(
+            btn_bar, text='恢复所选默认',
+            font=('Microsoft YaHei', 9),
+            bg='#f39c12', fg='white', activebackground='#d68910',
+            relief='flat', padx=12, pady=6,
+            command=restore_selected
+        ).pack(side='right', padx=(8, 0))
+
+        tk.Button(
+            btn_bar, text='清空全部修改',
+            font=('Microsoft YaHei', 9),
+            bg='#e74c3c', fg='white', activebackground='#c0392b',
+            relief='flat', padx=12, pady=6,
+            command=clear_all
+        ).pack(side='right')
+
+        refresh_table()
 
     def show_frequency_stats(self):
         """展示题目考频统计（基于作答记录）。"""
@@ -2459,7 +3509,7 @@ class QuizApp:
         }
 
         for q in self.questions:
-            rec = get_record(self.records, q['id'])
+            rec = get_record(self.records, q)
             attempts = rec['attempts']
             errors = rec['errors']
             error_rate = (errors / attempts * 100) if attempts > 0 else 0.0
@@ -2740,6 +3790,100 @@ class QuizApp:
 
 # ============ 主程序 ============
 
+def _dedupe_existing_paths(paths):
+    out = []
+    seen = set()
+    for p in paths or []:
+        ap = os.path.abspath(str(p))
+        if not os.path.exists(ap):
+            continue
+        if ap in seen:
+            continue
+        seen.add(ap)
+        out.append(ap)
+    return out
+
+
+def _choose_files_incrementally(parent, initial_dir, seed_paths=None):
+    """支持多次“增加文件”选择，便于跨目录导入。"""
+    chosen = _dedupe_existing_paths(seed_paths or [])
+    current_dir = initial_dir
+    if chosen:
+        current_dir = os.path.dirname(chosen[-1])
+
+    while True:
+        selected_paths = filedialog.askopenfilenames(
+            title='选择题库文件（可多选）',
+            initialdir=current_dir,
+            filetypes=[
+                ('题库文件', '*.txt *.pdf *.doc *.docx'),
+                ('文本文件', '*.txt'),
+                ('PDF 文件', '*.pdf'),
+                ('Word 文件', '*.doc *.docx'),
+                ('所有文件', '*.*')
+            ],
+            parent=parent
+        )
+
+        if selected_paths:
+            for p in selected_paths:
+                ap = os.path.abspath(p)
+                if ap not in chosen:
+                    chosen.append(ap)
+            current_dir = os.path.dirname(chosen[-1])
+
+        if chosen:
+            ans = messagebox.askyesnocancel(
+                '增加文件',
+                f'当前已选择 {len(chosen)} 个文件。\n是否继续增加文件？\n\n是：继续添加\n否：完成选择\n取消：放弃本次导入',
+                parent=parent
+            )
+            if ans is True:
+                continue
+            if ans is False:
+                return chosen
+            return []
+
+        retry = messagebox.askyesno(
+            '未选择文件',
+            '尚未选择任何文件，是否继续选择？',
+            parent=parent
+        )
+        if not retry:
+            return []
+
+
+def _choose_startup_files(parent, script_dir):
+    """启动时优先支持继续上次文件；否则进入多次添加模式。"""
+    state = load_app_state()
+    last_files = _dedupe_existing_paths(state.get('last_open_files', []))
+
+    if last_files:
+        preview = '\n'.join(os.path.basename(p) for p in last_files[:5])
+        if len(last_files) > 5:
+            preview += f'\n... 另 {len(last_files) - 5} 个'
+
+        use_last = messagebox.askyesnocancel(
+            '继续上次题库',
+            f'检测到上次打开的文件：\n{preview}\n\n是否直接继续使用上次文件？\n\n是：直接继续\n否：选择是否在上次基础上追加\n取消：退出',
+            parent=parent
+        )
+        if use_last is None:
+            return []
+        if use_last:
+            return last_files
+
+        append_last = messagebox.askyesno(
+            '追加方式',
+            '是否在上次文件基础上继续追加新文件？\n\n是：在上次基础上追加\n否：从空列表重新选择',
+            parent=parent
+        )
+        if append_last:
+            return _choose_files_incrementally(parent, script_dir, seed_paths=last_files)
+        return _choose_files_incrementally(parent, script_dir)
+
+    return _choose_files_incrementally(parent, script_dir)
+
 def main():
     _enable_windows_high_dpi()
 
@@ -2751,22 +3895,10 @@ def main():
     selector.withdraw()
     selector.update_idletasks()
 
-    # 手动选择题库文件（支持多选）
-    selected_paths = filedialog.askopenfilenames(
-        title='请选择一个或多个题库文件',
-        initialdir=script_dir,
-        filetypes=[
-            ('题库文件', '*.txt *.pdf *.doc *.docx'),
-            ('文本文件', '*.txt'),
-            ('PDF 文件', '*.pdf'),
-            ('Word 文件', '*.doc *.docx'),
-            ('所有文件', '*.*')
-        ],
-        parent=selector
-    )
+    selected_paths = _choose_startup_files(selector, script_dir)
     selector.destroy()
 
-    file_paths = list(selected_paths)
+    file_paths = _dedupe_existing_paths(selected_paths)
     if not file_paths:
         messagebox.showinfo('已取消', '未选择题库文件，程序将退出。')
         return
@@ -2825,7 +3957,7 @@ def main():
                 '每个文件采用自动识别方案后合并为同一题库'
             )
         ]
-        source_label = [os.path.basename(p) for p in file_paths]
+        source_label = f'多文件({len(file_paths)})'
 
     # 主窗口单独创建，确保可见
     root = tk.Tk()
@@ -2840,8 +3972,9 @@ def main():
         root.destroy()
         return
 
-    # 切换工作目录到脚本目录（使 error_record.json 保存在同一位置）
-    os.chdir(script_dir)
+    state = load_app_state()
+    state['last_open_files'] = file_paths
+    save_app_state(state)
 
     app = QuizApp(root, selected_questions, source_path=source_label)
     root.mainloop()
@@ -2849,6 +3982,12 @@ def main():
 
 def show_import_preview(root, candidates, source_path):
     """展示解析预览，用户确认后开始刷题。"""
+    manual_edits = load_manual_question_edits()
+    for _, qs, _ in candidates:
+        for q in qs:
+            _ensure_question_identity_fields(q)
+        apply_manual_question_edits(qs, manual_edits)
+
     win = tk.Toplevel(root)
     win.title('题库导入预览')
     screen_w = root.winfo_screenwidth()
@@ -2923,11 +4062,60 @@ def show_import_preview(root, candidates, source_path):
     )
     strategy_desc_label.pack(side='left', fill='x', expand=True)
 
+    edit_bar = tk.Frame(win, bg='#f5f5f5')
+    edit_bar.pack(fill='x', padx=12, pady=(0, 6))
+
+    edit_hint_label = tk.Label(
+        edit_bar,
+        text='可选中题目后手动修改题目和答案（多行编辑，双击行也可编辑）。',
+        bg='#f5f5f5', fg='#7f8c8d', font=('Microsoft YaHei', 9), anchor='w'
+    )
+    edit_hint_label.pack(side='left')
+
+    def _get_selected_question():
+        selected = tree.selection()
+        if not selected:
+            return None, None, None
+        iid = selected[0]
+        try:
+            q_idx = int(iid)
+        except Exception:
+            return None, None, None
+
+        c_idx = selected_idx.get()
+        if c_idx < 0 or c_idx >= len(candidates):
+            return None, None, None
+        questions = candidates[c_idx][1]
+        if q_idx < 0 or q_idx >= len(questions):
+            return None, None, None
+        return questions[q_idx], c_idx, q_idx
+
+    def edit_selected_question(_event=None):
+        q, c_idx, q_idx = _get_selected_question()
+        if q is None:
+            messagebox.showwarning('提示', '请先在预览表中选择一题。', parent=win)
+            return
+
+        edited = _show_question_edit_dialog(win, q, title='修改所选题（题目+答案）')
+        if not edited:
+            return
+
+        new_question_text, parsed, new_type, new_options = edited
+        q['text'] = new_question_text
+        q['answer'] = parsed
+        q['type'] = new_type
+        q['options'] = dict(new_options or {})
+        upsert_manual_question_edit(manual_edits, q)
+        refresh_summary(c_idx)
+        tree.selection_set(str(q_idx))
+        tree.focus(str(q_idx))
+        messagebox.showinfo('完成', '该题修改已保存，下次启动仍会生效。', parent=win)
+
     def fill_tree(questions):
         for item in tree.get_children():
             tree.delete(item)
 
-        for q in questions:
+        for q_idx, q in enumerate(questions):
             if isinstance(q.get('answer'), list):
                 answer_preview = ''.join(q['answer'])
             else:
@@ -2941,7 +4129,7 @@ def show_import_preview(root, candidates, source_path):
             if len(answer_preview) > 32:
                 answer_preview = answer_preview[:32] + '...'
 
-            tree.insert('', 'end', values=(
+            tree.insert('', 'end', iid=str(q_idx), values=(
                 q.get('id', ''),
                 type_name.get(q.get('type'), q.get('type', '')),
                 answer_preview,
@@ -2973,6 +4161,16 @@ def show_import_preview(root, candidates, source_path):
         refresh_summary(idx)
 
     strategy_combo.bind('<<ComboboxSelected>>', on_strategy_change)
+    tree.bind('<Double-1>', edit_selected_question)
+
+    tk.Button(
+        edit_bar, text='修改所选题（题目+答案）',
+        font=('Microsoft YaHei', 9),
+        bg='#f39c12', fg='white', activebackground='#d68910',
+        relief='flat', padx=10, pady=4,
+        command=edit_selected_question
+    ).pack(side='right')
+
     refresh_summary(0)
 
     yscroll = ttk.Scrollbar(body, orient='vertical', command=tree.yview)
