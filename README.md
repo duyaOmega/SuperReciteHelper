@@ -78,9 +78,13 @@ pip install python-docx pypdf pymupdf pywin32
 - 手动修题结果会在后续导入中自动应用。
 
 ## 实际效果
-![实际效果](image.png)
+![alt text](image.png)
 
-![实际效果2](image-1.png)
+![alt text](image-1.png)
+
+![alt text](image-2.png)
+
+![alt text](image-3.png)
 
 ## 开发过程
 第一份代码由本人和ChatGPT共同编写，当时只针对一种格式进行规划，目的是辅助本人背诵。
