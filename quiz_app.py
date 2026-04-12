@@ -8,7 +8,7 @@
 3. 记录错误次数到 error_record.json，支持断点续记
 4. 根据错误次数和错误率进行加权随机抽题
 """
-# Version 3.2.2
+# Version 3.2.3
 #author：duya2007,ChatGPT-5.3-Codex
 
 import tkinter as tk
@@ -88,6 +88,25 @@ def _extract_answer_keys_from_text(text):
     section = None
     started = False
     pair_re = re.compile(r'(\d{1,4})\s*[.、:：]\s*([A-HＡ-Ｈ]{1,8}|正确|错误|对|错)')
+    number_only_re = re.compile(r'^\s*(\d{1,4})\s*$')
+    answer_only_letter_re = re.compile(r'^\s*([A-HＡ-Ｈ]{1,8})\s*$')
+    answer_only_judge_re = re.compile(r'^\s*(正确|错误|对|错)\s*$')
+    pending_numbers = []
+    pending_answers = []
+
+    def flush_pending_to_current_section():
+        if not pending_numbers or not pending_answers:
+            return
+        # “题号与答案分行”时，按出现顺序一一配对。
+        pair_count = min(len(pending_numbers), len(pending_answers))
+        for i in range(pair_count):
+            qno = pending_numbers[i]
+            ans = _normalize_answer_text(pending_answers[i])
+            if section in result:
+                result[section][qno] = ans
+            result['generic'][qno] = ans
+        del pending_numbers[:pair_count]
+        del pending_answers[:pair_count]
 
     for line in lines:
         # 进入答案区
@@ -99,30 +118,34 @@ def _extract_answer_keys_from_text(text):
 
         # 分区切换（如“单选题参考答案”）
         if '单选' in line and '答案' in line:
+            flush_pending_to_current_section()
             section = 'single'
             continue
         if '多选' in line and '答案' in line:
+            flush_pending_to_current_section()
             section = 'multi'
             continue
         if '判断' in line and '答案' in line:
+            flush_pending_to_current_section()
             section = 'judge'
             continue
         if '填空' in line and '答案' in line:
+            flush_pending_to_current_section()
             section = 'blank'
             continue
         if '简答' in line and '答案' in line:
+            flush_pending_to_current_section()
             section = 'short'
             continue
 
         # 新题区标题出现时退出答案分区
         sec_heading = _detect_section_heading(line)
         if sec_heading and '答案' not in line:
+            flush_pending_to_current_section()
             section = None
             continue
 
         pairs = list(pair_re.finditer(line))
-        if not pairs:
-            continue
 
         for m in pairs:
             qno = int(m.group(1))
@@ -131,7 +154,271 @@ def _extract_answer_keys_from_text(text):
                 result[section][qno] = ans
             result['generic'][qno] = ans
 
+        if pairs:
+            continue
+
+        # 兼容“题号与答案分行”的文末答案格式：
+        # 例如：1\n2\n3\n...\nD\nC\nA
+        m_num = number_only_re.match(line)
+        if m_num:
+            pending_numbers.append(int(m_num.group(1)))
+            flush_pending_to_current_section()
+            continue
+
+        # 可能是单个字母答案（如 D / AC / Ｂ）
+        m_ans_letter = answer_only_letter_re.match(line)
+        if m_ans_letter:
+            pending_answers.append(_normalize_answer_text(m_ans_letter.group(1)))
+            flush_pending_to_current_section()
+            continue
+
+        # 判断题答案仅在判断题分区下采集，避免把正文“对/错”噪声误当答案。
+        if section == 'judge':
+            m_ans_judge = answer_only_judge_re.match(line)
+            if m_ans_judge:
+                pending_answers.append(_normalize_answer_text(m_ans_judge.group(1)))
+                flush_pending_to_current_section()
+                continue
+
+        # 一行多个 token（空格/顿号/逗号分隔）
+        # 仅在“整行几乎全是答案字符+分隔符”时采集，避免把正文（如 GPT）误当答案。
+        if section == 'judge':
+            multi_line_ok = bool(re.fullmatch(r'[A-HＡ-Ｈ正确错误对错\s,，、;；/\\|]+', line))
+            token_pat = r'[A-HＡ-Ｈ]{1,8}|正确|错误|对|错'
+        else:
+            multi_line_ok = bool(re.fullmatch(r'[A-HＡ-Ｈ\s,，、;；/\\|]+', line))
+            token_pat = r'[A-HＡ-Ｈ]{1,8}'
+
+        if multi_line_ok:
+            multi_tokens = re.findall(token_pat, line)
+            if multi_tokens:
+                pending_answers.extend(_normalize_answer_text(tok) for tok in multi_tokens)
+                flush_pending_to_current_section()
+
+    flush_pending_to_current_section()
+
     return result
+
+
+def _parse_docx_numbered_choice_questions(filepath):
+    """解析使用 Word 自动编号的选择题（题号/选项字母不在纯文本中）。"""
+    try:
+        from docx import Document
+    except Exception:
+        return []
+
+    try:
+        doc = Document(filepath)
+    except Exception:
+        return []
+
+    def get_num_info(para):
+        try:
+            ppr = para._p.pPr if para._p is not None else None
+            num_pr = ppr.numPr if ppr is not None else None
+            if num_pr is None:
+                return None, None
+            num_id = int(num_pr.numId.val) if num_pr.numId is not None else None
+            ilvl = int(num_pr.ilvl.val) if num_pr.ilvl is not None else None
+            return num_id, ilvl
+        except Exception:
+            return None, None
+
+    items = []
+    for para in doc.paragraphs:
+        text = (para.text or '').strip()
+        if not text:
+            continue
+
+        if ('参考答案' in text) or ('标准答案' in text):
+            break
+
+        num_id, ilvl = get_num_info(para)
+        items.append({'text': text, 'num_id': num_id, 'ilvl': ilvl})
+
+    if not items:
+        return []
+
+    def looks_like_question_stem(text):
+        t = str(text or '').strip()
+        if not t:
+            return False
+        if OPTION_PREFIX_RE.match(t):
+            return False
+        if re.match(r'^[（(]\s*\d+\s*[)）]', t):
+            return False
+        if re.match(r'^[A-HＡ-Ｈ][.、．,，\)）:：]', t):
+            return False
+        if t.startswith('#include'):
+            return False
+        return len(t) >= 4
+
+    # 识别“题干所在的主编号列表”：按结构特征评分而非单纯出现次数。
+    num_id_counts = {}
+    num_id_positions = {}
+    for it in items:
+        nid = it.get('num_id')
+        if nid is None:
+            continue
+        num_id_counts[nid] = num_id_counts.get(nid, 0) + 1
+        num_id_positions.setdefault(nid, []).append(it)
+
+    if not num_id_counts:
+        return []
+
+    def score_num_id(nid):
+        rows = num_id_positions.get(nid, [])
+        count = len(rows)
+        stem_like = 0
+        option_like = 0
+        enum_like = 0
+        punct_like = 0
+
+        for row in rows:
+            txt = str(row.get('text', '') or '').strip()
+            if looks_like_question_stem(txt):
+                stem_like += 1
+            if OPTION_PREFIX_RE.match(txt) or re.match(r'^[A-HＡ-Ｈ][.、．,，\)）:：]', txt):
+                option_like += 1
+            if re.match(r'^[（(]\s*\d+\s*[)）]', txt):
+                enum_like += 1
+            if ('：' in txt) or (':' in txt) or ('？' in txt) or ('?' in txt):
+                punct_like += 1
+
+        # 高 stem_like + punct_like 倾向于题干编号；option/枚举倾向于选项或材料编号。
+        return (
+            stem_like * 2.0 +
+            punct_like * 0.8 +
+            min(count, 30) * 0.05 -
+            option_like * 1.5 -
+            enum_like * 0.8
+        )
+
+    question_num_id = max(num_id_counts.keys(), key=score_num_id)
+    if num_id_counts.get(question_num_id, 0) < 8:
+        return []
+
+    question_starts = [
+        idx for idx, it in enumerate(items)
+        if it.get('num_id') == question_num_id
+        and '试题结束' not in it.get('text', '')
+        and '答案' not in it.get('text', '')
+    ]
+
+    if len(question_starts) < 8:
+        return []
+
+    def build_fallback_options(rows):
+        # 当选项字母不可见时，按顺序映射 A/B/C/D...
+        if not rows:
+            return {}
+
+        # 优先：块末尾若存在同一编号的连续段，通常就是选项列表。
+        tail_candidates = []
+        idx = len(rows) - 1
+        while idx >= 0 and not str(rows[idx].get('text', '') or '').strip():
+            idx -= 1
+
+        if idx >= 0:
+            tail_num = rows[idx].get('num_id')
+            if tail_num is not None and tail_num != question_num_id:
+                j = idx
+                while j >= 0:
+                    rj = rows[j]
+                    if rj.get('num_id') != tail_num:
+                        break
+                    txt = str(rj.get('text', '') or '').strip()
+                    if txt:
+                        tail_candidates.append(txt)
+                    j -= 1
+                tail_candidates.reverse()
+
+        if 2 <= len(tail_candidates) <= 8:
+            letters = 'ABCDEFGH'
+            return {letters[i]: _clean_option_text(t) for i, t in enumerate(tail_candidates) if i < len(letters)}
+
+        candidates = []
+        for row in rows:
+            t = str(row.get('text', '') or '').strip()
+            if not t:
+                continue
+            if '参考答案' in t or '试题结束' in t:
+                continue
+            candidates.append(t)
+
+        if len(candidates) > 8:
+            candidates = candidates[-8:]
+
+        if not (2 <= len(candidates) <= 8):
+            return {}
+
+        letters = 'ABCDEFGH'
+        options = {}
+        for i, t in enumerate(candidates):
+            if i >= len(letters):
+                break
+            options[letters[i]] = _clean_option_text(t)
+        return options
+
+    questions = []
+    for pos, start_idx in enumerate(question_starts):
+        end_idx = question_starts[pos + 1] if pos + 1 < len(question_starts) else len(items)
+        block_items = items[start_idx:end_idx]
+        if not block_items:
+            continue
+
+        question_line = block_items[0].get('text', '').strip()
+        block_lines = [it.get('text', '').strip() for it in block_items if it.get('text', '').strip()]
+        if not question_line or len(block_lines) < 1:
+            continue
+
+        parsed = parse_single_block('\n'.join(block_lines))
+        if parsed and parsed.get('options'):
+            parsed['source_no'] = len(questions) + 1
+            questions.append(parsed)
+            continue
+
+        fallback_options = build_fallback_options(block_items[1:])
+        if fallback_options:
+            questions.append({
+                'id': 0,
+                'text': question_line,
+                'options': fallback_options,
+                'answer': [],
+                'type': 'single',
+                'source_no': len(questions) + 1,
+            })
+
+    if not questions:
+        return []
+
+    extracted_text = extract_text_by_filetype(filepath)
+    answer_keys = _extract_answer_keys_from_text(extracted_text)
+    generic_map = answer_keys.get('generic', {})
+
+    for idx, q in enumerate(questions, 1):
+        token = generic_map.get(idx, '')
+        if not token:
+            continue
+
+        letters = _extract_choice_answer(token, q.get('options') or {})
+        if not letters:
+            normalized = _normalize_answer_text(token)
+            letters = re.findall(r'[A-H]', normalized)
+            letters = sorted(set(letters), key=letters.index) if letters else []
+
+        q['answer'] = letters
+        if _is_judge_options(q.get('options') or {}):
+            q['type'] = 'judge'
+        elif len(letters) > 1:
+            q['type'] = 'multi'
+        else:
+            q['type'] = 'single'
+
+    for idx, q in enumerate(questions, 1):
+        q['id'] = idx
+
+    return questions
 
 
 def _fill_answers_from_answer_keys(questions, answer_keys):
@@ -1747,30 +2034,6 @@ def _parse_numbered_qa_blocks(text):
     return questions
 
 
-def _apply_pdf_known_blank_patterns(text):
-    """针对无样式信息的 PDF，按高置信固定表达做保底挖空。"""
-    t = (text or '').strip()
-    if not t:
-        return None
-
-    compact = re.sub(r'\s+', '', t)
-
-    # 2020 秋初党常见表述：仅“伟大斗争”“伟大梦想”为填空位。
-    pattern = re.compile(r'统揽\s*伟大斗争\s*[、，,]\s*伟大工程\s*[、，,]\s*伟大事业\s*[、，,]\s*伟大梦想')
-    if pattern.search(compact):
-        masked = pattern.sub('统揽（1）______、伟大工程、伟大事业、（2）______', compact)
-        answer = '（1）伟大斗争；（2）伟大梦想'
-        return masked, answer
-
-    pattern2 = re.compile(r'可以延长预备期，但不能超过一年；不履行党员义务，不具备党员条件的，应当取消预备党员资格')
-    if pattern2.search(compact):
-        masked = pattern2.sub('可以延长预备期，但不能超过（1）______；不履行党员义务，不具备党员条件的，（2）______', compact)
-        answer = '（1）一年；（2）应当取消预备党员资格'
-        return masked, answer
-
-    return None
-
-
 def _convert_text_to_judge_question(text):
     """将末尾带“对/错”标记的文本转为判断题。"""
     t = re.sub(r'\s+', ' ', str(text or '')).strip()
@@ -1947,6 +2210,13 @@ def parse_questions(filepath):
 
     # docx 优先尝试“红色选项直读”，避免回退文本解析误判答案。
     if ext == '.docx':
+        numbered_choice_questions = _parse_docx_numbered_choice_questions(filepath)
+        if numbered_choice_questions:
+            answered = sum(1 for q in numbered_choice_questions if q.get('options') and q.get('answer'))
+            # 自动编号试卷一般是纯选择题，命中到稳定规模时优先采用。
+            if len(numbered_choice_questions) >= 10 and answered >= max(5, len(numbered_choice_questions) // 3):
+                return numbered_choice_questions
+
         red_docx_questions = _parse_docx_questions_with_red(filepath)
         styled_blank_questions = _parse_docx_styled_blank_questions(filepath)
         if red_docx_questions:
@@ -2034,7 +2304,7 @@ def parse_questions(filepath):
             questions = _merge_docx_blank_questions(questions, styled_blank_questions)
 
     if ext == '.pdf':
-        # PDF 可能因断行导致“题干+下一行正文”被误拆成短答，这里先合并再做保底挖空。
+        # PDF 可能因断行导致“题干+下一行正文”被误拆成短答，这里先做通用回并。
         for q in questions:
             if q.get('type') != 'short' or q.get('options'):
                 continue
@@ -2055,30 +2325,10 @@ def parse_questions(filepath):
             if not merged_text:
                 continue
 
-            pattern_result = _apply_pdf_known_blank_patterns(merged_text)
-            if pattern_result:
-                masked, ans = pattern_result
-                q['type'] = 'blank'
-                q['text'] = masked
-                q['answer'] = ans
-            elif ans_is_continuation:
+            if ans_is_continuation:
                 # 仅回并正文，不强行当作已知填空。
                 q['text'] = merged_text
                 q['answer'] = ''
-
-        # 对已识别为单空的“预备期满”题目做补空修正。
-        for q in questions:
-            if q.get('type') != 'blank':
-                continue
-            text_v = str(q.get('text', '') or '')
-            if ('可以延长预备期' in text_v and '应当取消预备党员资格' in text_v and '（2）' not in text_v):
-                q['text'] = text_v.replace('应当取消预备党员资格', '（2）______')
-                ans_v = str(q.get('answer', '') or '')
-                if '应当取消预备党员资格' not in ans_v:
-                    if ans_v.strip():
-                        q['answer'] = _clean_answer_text(ans_v + '；（2）应当取消预备党员资格')
-                    else:
-                        q['answer'] = '（2）应当取消预备党员资格'
 
         _postprocess_pdf_to_judge(questions)
         questions = _split_compound_placeholder_judge_questions(questions)
