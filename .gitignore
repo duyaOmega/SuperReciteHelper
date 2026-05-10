@@ -27,3 +27,6 @@ build/
 
 # 存档
 save*
+
+# 图片
+image/
