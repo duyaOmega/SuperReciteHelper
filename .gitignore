@@ -1,1 +1,29 @@
+# Python 缓存
 __pycache__/
+*.py[cod]
+
+# 虚拟环境
+.venv/
+venv/
+
+# 编辑器配置
+.vscode/
+.idea/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+
+# 环境变量和密钥
+.env
+.env.local
+
+# 构建产物
+dist/
+build/
+
+# 存档
+save*
