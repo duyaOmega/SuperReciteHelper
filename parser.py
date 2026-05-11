@@ -8,13 +8,7 @@
 """
 '''
 2026-05-10 扔给ai做了缩减，我手动测试了一下能跑。反正我先传到dev分支，后续可以再改。
-下面是测试题库之一，识别无误。
-1.【单选题】张静老师在《漫谈青年知识分子的成长》中讲到，为人.为学.行事三者中   是根本。
- A.为人
- B.为学
- C.行事
- D.立志
-正确答案：A
+测试题库可以见测试集\
 '''
 
 import re
@@ -58,9 +52,7 @@ def _normalize_extracted_text(text):
         return ''
     t = text.replace('\r\n', '\n').replace('\r', '\n').replace('\u3000', ' ')
     # 下面一行将答案行单独分开。
-    t = re.sub(
-    r'(?<!\n)(?<!正确)(?<!参考)(?<!标准)(正确答案|参考答案|标准答案|答案|答)[：:]',
-    r'\n\1：',t)
+    t = re.sub(r'(?<!\n)(?<!正确)(?<!参考)(?<!标准)(正确答案|参考答案|标准答案|答案|答)[：:]'  ,  r'\n\1：',t)
     # 题号前换行；保留小数不被误拆。
     t = re.sub(r'(?<![\n\d])(\d{1,3}(?:[、．\)]|[.](?!\d)))', r'\n\1', t)
     return re.sub(r'\n{3,}', '\n\n', t).strip()
@@ -148,8 +140,8 @@ def _extract_choice_answer(answer_text, options):
     if letters:
         return sorted(set(letters), key=letters.index)
     if len(options) == 2:
-        true_w = ('正确', '对', '是')
-        false_w = ('错误', '错', '否', '不正确')
+        true_w = ('正确', '对', '是','√')
+        false_w = ('错误', '错', '否', '不正确','×','x','X')
         for k, v in options.items():
             opt = v.strip()
             if any(w in answer_text for w in true_w) and any(w in opt for w in true_w):
@@ -177,9 +169,11 @@ def _is_blank_question(question_text):
 
 # --- 文末答案区识别与回填 --------------------------------------------------
 def _extract_answer_keys_from_text(text):
-    """从文末答案区抽取“题号 -> 答案”映射，按单选/多选/判断分区。
+    """从文末答案区抽取题号->答案映射，按单选/多选/判断分区。
 
-    只处理常见格式：题号与答案在同一行（如 12.A 或 12：正确）。
+    支持两种格式:
+      1) 题号与答案在同一行(如 12.A 或 12:正确);
+      2) 题号与答案在交替行(如 1\\nD\\n2\\nD)。
     """
     lines = [l.strip() for l in str(text or '').split('\n') if l.strip()]
     result = {k: {} for k in ('single', 'multi', 'judge', 'blank', 'short', 'generic')}
@@ -188,9 +182,13 @@ def _extract_answer_keys_from_text(text):
     title_re = re.compile(r'^\s*(?:(?:单选|多选|判断|填空|简答)题\s*)?'
                           r'(?:参考答案|标准答案|答案)\s*[：:]?\s*$')
     pair_re = re.compile(r'(\d{1,4})\s*[.、:：]\s*([A-HＡ-Ｈ]{1,8}|正确|错误|对|错)')
+    bare_number_re = re.compile(r'^(\d{1,4})$')
     sec_kw = {'single': '单选', 'multi': '多选', 'judge': '判断',
               'blank': '填空', 'short': '简答'}
+    # 分区section：如果答案区有明显的“单选题”、“多选题”、“判断题”等分区标题，则把后续题号-答案对归入对应分区，供后续回填时优先匹配；否则统一放在 generic 分区。
 
+    # 收集答案区的所有行（去标题后）
+    answer_lines = []
     for line in lines:
         if title_re.match(line):
             started = True
@@ -199,21 +197,60 @@ def _extract_answer_keys_from_text(text):
             continue
         switched = False
         for sk, kw in sec_kw.items():
-            if kw in line and '答案' in line:
-                section = sk
-                switched = True
+            if kw in line and '答案' in line: # keyword，即对应的中文关键词（'单选'、'多选'、'判断'）
+                section = sk # section key，即分区标识'single'、'multi'、'judge'
+                switched = True #表示"这行是分区标题，不是答案数据"，为 True 时跳过这行，不把它加入 answer_lines
                 break
         if switched:
             continue
         if _detect_section_heading(line) and '答案' not in line:
             section = None
             continue
+        answer_lines.append((line, section))
+
+    # 先尝试同行配对（如 12.A）
+    for line, sec in answer_lines:
         for m in pair_re.finditer(line):
-            qno = int(m.group(1))
-            ans = _normalize_answer_text(m.group(2))
-            if section in result:
-                result[section][qno] = ans
-            result['generic'].setdefault(qno, ans)
+            qno = int(m.group(1)) # 题号
+            ans = _normalize_answer_text(m.group(2)) # 答案文本
+            if sec in result: # 如果已知分区（题目类型）
+                result[sec][qno] = ans
+            result['generic'].setdefault(qno, ans) # 无论分区如何，都往 generic（通用）里存一份。
+
+    # 同行配对未命中时，尝试表格布局（连续题号行 + 连续答案行按位置配对），这也是测试集中程设期中的格式。
+    if not result['generic']:
+        pending_nos = []
+        pending_secs = []
+        collected_answers = []
+        for line, sec in answer_lines:
+            m = bare_number_re.match(line)
+            if m: # 是题号
+                pending_nos.append(int(m.group(1)))
+                pending_secs.append(sec) 
+                continue
+            if _looks_like_answer_token(line): # 是答案
+                collected_answers.append(_normalize_answer_text(line))
+                if len(collected_answers) >= len(pending_nos):# 答案>=题号，开始给题号分配答案
+                    for i, qno in enumerate(pending_nos):
+                        tok = collected_answers[i] if i < len(collected_answers) else ''
+                        if not tok:
+                            continue
+                        s = pending_secs[i]
+                        if s in result:
+                            result[s][qno] = tok
+                        result['generic'].setdefault(qno, tok)
+                    pending_nos, pending_secs, collected_answers = [], [], [] # 配对完后全部清空，准备接收下一组题号和答案。
+                continue
+        # 循环结束时处理残余
+        if pending_nos and collected_answers:
+            for i, qno in enumerate(pending_nos):
+                tok = collected_answers[i] if i < len(collected_answers) else ''
+                if not tok:
+                    continue
+                s = pending_secs[i]
+                if s in result:
+                    result[s][qno] = tok
+                result['generic'].setdefault(qno, tok)
     return result
 
 def _fill_answers_from_answer_keys(questions, answer_keys):
@@ -441,7 +478,18 @@ def parse_single_block(block):
 
 def parse_questions(filepath):
     """解析题库文件，提取题目、选项、正确答案（仅 txt / docx）。"""
-    text = _normalize_extracted_text(extract_text_by_filetype(filepath))
+    full_text = _normalize_extracted_text(extract_text_by_filetype(filepath))
+
+    # 切掉文末答案区用于题块拆分，但保留全文用于答案回填。
+    answer_section_re = re.compile(
+        r'^\s*(?:(?:单选|多选|判断|填空|简答)题\s*)?'
+        r'(?:参考答案|标准答案|答案)\s*[：:]?\s*$')
+    all_lines = full_text.split('\n')
+    text = full_text
+    for i, ln in enumerate(all_lines):
+        if answer_section_re.match(ln.strip()):
+            text = '\n'.join(all_lines[:i])
+            break
 
     questions = []
     lines = text.split('\n')
@@ -482,7 +530,7 @@ def parse_questions(filepath):
                 q['section_hint'] = hint
             questions.append(q)
 
-    _fill_answers_from_answer_keys(questions, _extract_answer_keys_from_text(text))
+    _fill_answers_from_answer_keys(questions, _extract_answer_keys_from_text(full_text))
 
     # 没解析出题目时再尝试编号简答回退。
     if not questions:

@@ -24,9 +24,13 @@ Thumbs.db
 # 构建产物
 dist/
 build/
+*.spec
 
 # 存档
 save*
 
 # 图片
 image/
+
+# ai
+.claude
