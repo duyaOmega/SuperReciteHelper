@@ -2,19 +2,11 @@
 # -*- coding: utf-8 -*-
 """应用状态、题目身份键、手动修改与做题记录持久化模块。"""
 
-import tkinter as tk
-from tkinter import messagebox, font as tkfont, filedialog, ttk
 import re
 import json
 import os
-import random
-import math
 import hashlib
 from datetime import datetime
-import ctypes
-import tempfile
-import zipfile
-import xml.etree.ElementTree as ET
 
 APP_NAME = 'SuperReciteHelper'
 
