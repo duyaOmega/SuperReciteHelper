@@ -34,10 +34,8 @@ def weighted_random_pick(questions, records):
 
         # 错误次数越多权重越大
         if errors >= 5:
-            weight += 3.0
+            weight += 2.5
         elif errors >= 3:
-            weight += 2.0
-        elif errors >= 1:
             weight += 1.0
 
         # 错误率高的加权
@@ -46,14 +44,25 @@ def weighted_random_pick(questions, records):
                 weight += 3.0
             elif error_rate > 0.3:
                 weight += 1.5
-            elif error_rate > 0:
-                weight += 0.5
 
-        # 从未做过的题目也适当提高权重
+        # 从未做过的题目：剩余越少，加权越高，确保能刷完题库
         if attempts == 0:
-            weight += 0.5
+            weight += 2.0
 
         weights.append(weight)
+
+    # 根据未做题目占比动态提升未做题的加权
+    # ratio = unseen_count / total_count — 未做题目占比
+    # boost = 1.0 / ratio — 越少未做，boost 越大
+    unseen_count = sum(1 for q in questions if get_record(records, q)['attempts'] == 0)
+    total_count = len(questions)
+    if unseen_count > 0 and unseen_count < total_count:
+        # ratio 越小（剩余未做越少），boost 越大
+        ratio = unseen_count / total_count
+        boost = 1.0 / ratio
+        for i in range(len(weights)):
+            if get_record(records, questions[i])['attempts'] == 0:
+                weights[i] *= boost
 
     # 加权随机选择
     total = sum(weights)
