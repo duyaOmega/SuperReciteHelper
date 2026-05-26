@@ -6,3 +6,4 @@
 | 05.10 | 让ai大幅删改了parser.py | RavenX2007 |
 | 05.11 | 修了一下parser.py中文末答案区的配对，现在它可以正确识别测试集中程设的期中选择题了| RavenX2007 |
 | 05.25 | 改tk为PyQt，并将ui_main拆成三个文件，详见PyQt改进思路 | jih484287-wq |
+| 05.26 | 重新设计了下UI，删去了去除重复题的功能；去除question.py和question_bank.py里和tk相关的部分 | jih484287-wq |
