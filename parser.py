@@ -82,6 +82,14 @@ def _looks_like_question_start_line(text):
         return False
     return True
 
+def _strip_no_answer_appendix(text):
+    """去掉文末“无答案版”等复习附录，避免混入最后一题答案。"""
+    lines = str(text or '').split('\n')
+    for i, line in enumerate(lines):
+        if re.fullmatch(r'\s*(?:无答案版|无答案版题目|无答案题目)\s*', line):
+            return '\n'.join(lines[:i]).strip()
+    return text
+
 def _looks_like_answer_token(text):
     if not text or _looks_like_option_line(text):
         return False
@@ -330,6 +338,7 @@ def _split_content_and_answer(lines):
 
 def _parse_numbered_qa_blocks(text):
     """解析“每题一行问题 + 后续多行答案”的编号简答题格式。"""
+    text = _strip_no_answer_appendix(text)
     lines = [l.strip() for l in text.split('\n') if l.strip()]
     if not lines:
         return []
@@ -348,12 +357,15 @@ def _parse_numbered_qa_blocks(text):
     for block in blocks:
         if len(block) < 2 or _has_option_structure(block):
             continue
+        m_no = re.match(r'^\s*(\d{1,4})\s*[.、．\)]', block[0])
+        source_no = int(m_no.group(1)) if m_no else None
         q_text = QUESTION_START_RE.sub('', block[0]).strip()
         ans_text = _clean_answer_text('\n'.join(block[1:]).strip())
         if not q_text or not ans_text:
             continue
         questions.append({'id': 0, 'text': q_text, 'options': {}, 'answer': ans_text,
-                          'type': 'blank' if _is_blank_question(q_text) else 'short'})
+                          'type': 'blank' if _is_blank_question(q_text) else 'short',
+                          'source_no': source_no})
     for idx, q in enumerate(questions, 1):
         q['id'] = idx
     return questions
@@ -479,6 +491,7 @@ def parse_single_block(block):
 def parse_questions(filepath):
     """解析题库文件，提取题目、选项、正确答案（仅 txt / docx）。"""
     full_text = _normalize_extracted_text(extract_text_by_filetype(filepath))
+    full_text = _strip_no_answer_appendix(full_text)
 
     # 切掉文末答案区用于题块拆分，但保留全文用于答案回填。
     answer_section_re = re.compile(
@@ -532,9 +545,10 @@ def parse_questions(filepath):
 
     _fill_answers_from_answer_keys(questions, _extract_answer_keys_from_text(full_text))
 
-    # 没解析出题目时再尝试编号简答回退。
-    if not questions:
-        questions = _parse_numbered_qa_blocks(text)
+    # 编号问答格式的题干不一定带问号；主解析偏少时采用更完整的编号解析。
+    numbered_questions = _parse_numbered_qa_blocks(text)
+    if not questions or len(numbered_questions) > len(questions):
+        questions = numbered_questions
 
     # 主观题答案中含“（1）xxx；（2）yyy”形式时，转为填空题并自动挖空。
     for q in questions:
