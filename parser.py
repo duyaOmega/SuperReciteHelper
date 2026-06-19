@@ -53,8 +53,8 @@ def _normalize_extracted_text(text):
     t = text.replace('\r\n', '\n').replace('\r', '\n').replace('\u3000', ' ')
     # 下面一行将答案行单独分开。
     t = re.sub(r'(?<!\n)(?<!正确)(?<!参考)(?<!标准)(正确答案|参考答案|标准答案|答案|答)[：:]'  ,  r'\n\1：',t)
-    # 题号前换行；保留小数不被误拆。
-    t = re.sub(r'(?<![\n\d])(\d{1,3}(?:[、．\)]|[.](?!\d)))', r'\n\1', t)
+    # 题号前换行；保留小数不被误拆；括号子项如 (1) 不拆。
+    t = re.sub(r'(?<![\n\d(])(\d{1,3}(?:[、．\)]|[.](?!\d)))', r'\n\1', t)
     return re.sub(r'\n{3,}', '\n\n', t).strip()
 
 def _looks_like_option_line(text):
@@ -488,6 +488,58 @@ def parse_single_block(block):
     return {'id': 0, 'text': question_text, 'options': options,
             'answer': answer_value, 'type': q_type, 'source_no': source_no}
 
+def _merge_answer_sub_items(questions):
+    """将答案中被误拆的子项编号重新合并回上一题的答案。
+
+    检测模式：source_no 递增且文本无问号无选项的连续题目，如果前一题
+    有答案且 source_no 跳跃（上一真实题号 >> 当前子项编号），说明这些
+    是答案子项被误识别为独立题，需要合并。
+    """
+    if len(questions) < 2:
+        return questions
+    merged = [questions[0]]
+    merging = False  # 是否正在合并子项序列
+    for q in questions[1:]:
+        prev = merged[-1]
+        q_no = q.get('source_no')
+        no_question_mark = '？' not in q.get('text', '') and '?' not in q.get('text', '')
+        no_options = not q.get('options')
+
+        # 子项序列的开始：source_no=1，无问号，无选项，前一题有答案
+        if (not merging and q_no == 1 and no_question_mark and no_options
+                and prev.get('answer')):
+            merging = True
+
+        # 子项序列的延续：正在合并中，source_no 递增且无问号，
+        # 但 source_no 超过 10 说明是真正的新题（如 84.xxx），退出合并。
+        if merging and q_no is not None and q_no > 10:
+            merging = False
+        is_sub = merging and no_question_mark and no_options and q_no is not None
+
+        if is_sub:
+            # 把当前题的文本和答案追加到前一题的答案中
+            sub_text = q.get('text', '')
+            sub_answer = str(q.get('answer', '') or '')
+            prev_answer = str(prev.get('answer', '') or '')
+            combined = prev_answer.rstrip() + '\n' + sub_text
+            if sub_answer:
+                combined += '\n' + sub_answer
+            prev['answer'] = combined.strip()
+            # 如果前一题是 short，检查是否应转为 blank
+            if prev.get('type') == 'short':
+                combined_for_check = prev.get('text', '') + ' ' + combined
+                if _is_blank_question(combined_for_check):
+                    prev['type'] = 'blank'
+                    prev['text'] = _mask_blank_question_text(prev.get('text', ''), combined.strip())
+        else:
+            merging = False
+            merged.append(q)
+    # 重新编号
+    for i, q in enumerate(merged, 1):
+        q['id'] = i
+    return merged
+
+
 def parse_questions(filepath):
     """解析题库文件，提取题目、选项、正确答案（仅 txt / docx）。"""
     full_text = _normalize_extracted_text(extract_text_by_filetype(filepath))
@@ -550,13 +602,16 @@ def parse_questions(filepath):
     if not questions or len(numbered_questions) > len(questions):
         questions = numbered_questions
 
-    # 主观题答案中含“（1）xxx；（2）yyy”形式时，转为填空题并自动挖空。
+    # 主观题答案中含”（1）xxx；（2）yyy”形式时，转为填空题并自动挖空。
     for q in questions:
         if q.get('type') == 'short':
             ans = str(q.get('answer', '') or '')
             if re.search(r'（\s*\d+\s*）\s*[^；;\n]+', ans):
                 q['type'] = 'blank'
                 q['text'] = _mask_blank_question_text(q.get('text', ''), ans)
+
+    # 合并答案中被误拆的子项编号（如 1.顺应人类文明进程）。
+    questions = _merge_answer_sub_items(questions)
 
     for i, q in enumerate(questions):
         q['id'] = i + 1
