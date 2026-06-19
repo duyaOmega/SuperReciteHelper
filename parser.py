@@ -360,7 +360,16 @@ def _parse_numbered_qa_blocks(text):
         m_no = re.match(r'^\s*(\d{1,4})\s*[.、．\)]', block[0])
         source_no = int(m_no.group(1)) if m_no else None
         q_text = QUESTION_START_RE.sub('', block[0]).strip()
-        ans_text = _clean_answer_text('\n'.join(block[1:]).strip())
+        raw_ans = '\n'.join(block[1:]).strip()
+        # 剥离答案标签前缀（如 "正确答案："）
+        ans_lines = raw_ans.split('\n')
+        first = ans_lines[0].strip()
+        m_label = ANSWER_LABEL_RE.match(first)
+        if m_label:
+            head = m_label.group(1).strip()
+            rest = [l for l in ans_lines[1:] if l.strip()]
+            raw_ans = '\n'.join([head] + rest).strip() if head else '\n'.join(rest).strip()
+        ans_text = _clean_answer_text(raw_ans)
         if not q_text or not ans_text:
             continue
         questions.append({'id': 0, 'text': q_text, 'options': {}, 'answer': ans_text,
@@ -469,7 +478,9 @@ def parse_single_block(block):
 
     if not question_text:
         return None
-    if not options and not (answer_text or '').strip():
+    # 有答案标签但答案为空时保留（答案可能来自后续子项）。
+    has_answer_label = any(ANSWER_LABEL_RE.match(l) for l in lines)
+    if not options and not (answer_text or '').strip() and not has_answer_label:
         return None
 
     if options:
@@ -505,9 +516,8 @@ def _merge_answer_sub_items(questions):
         no_question_mark = '？' not in q.get('text', '') and '?' not in q.get('text', '')
         no_options = not q.get('options')
 
-        # 子项序列的开始：source_no=1，无问号，无选项，前一题有答案
-        if (not merging and q_no == 1 and no_question_mark and no_options
-                and prev.get('answer')):
+        # 子项序列的开始：source_no=1，无问号，无选项
+        if (not merging and q_no == 1 and no_question_mark and no_options):
             merging = True
 
         # 子项序列的延续：正在合并中，source_no 递增且无问号，
@@ -599,16 +609,23 @@ def parse_questions(filepath):
 
     # 编号问答格式的题干不一定带问号；主解析偏少时采用更完整的编号解析。
     numbered_questions = _parse_numbered_qa_blocks(text)
+    numbered_questions = _merge_answer_sub_items(numbered_questions)
     if not questions or len(numbered_questions) > len(questions):
         questions = numbered_questions
 
     # 主观题答案中含”（1）xxx；（2）yyy”形式时，转为填空题并自动挖空。
+    # 仅当挖空后题干的中文字符数足够（≥原题干的一半）时才转换，
+    # 避免答案与题干重叠导致题干被错误破坏（如 “怎样推进xxx” 的答案含 “推进xxx”）。
     for q in questions:
         if q.get('type') == 'short':
             ans = str(q.get('answer', '') or '')
             if re.search(r'（\s*\d+\s*）\s*[^；;\n]+', ans):
-                q['type'] = 'blank'
-                q['text'] = _mask_blank_question_text(q.get('text', ''), ans)
+                masked = _mask_blank_question_text(q.get('text', ''), ans)
+                orig_cjk = len(re.findall(r'[一-鿿]', q.get('text', '')))
+                masked_cjk = len(re.findall(r'[一-鿿]', masked))
+                if masked_cjk >= orig_cjk // 2:
+                    q['type'] = 'blank'
+                    q['text'] = masked
 
     # 合并答案中被误拆的子项编号（如 1.顺应人类文明进程）。
     questions = _merge_answer_sub_items(questions)
