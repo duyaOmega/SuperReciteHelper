@@ -7,9 +7,9 @@ import sys
 
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from parser import build_parse_candidates
-from question_bank import load_app_state, save_app_state
-from ui_pyqt import QuizWindow
+from src.core.parser import build_parse_candidates
+from src.core.question_bank import load_app_state, save_app_state
+from src.ui.ui_pyqt import QuizWindow
 
 
 def _choose_question_file(parent=None):

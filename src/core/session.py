@@ -16,7 +16,7 @@ import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
 
-from question_bank import get_record
+from .question_bank import get_record
 
 def weighted_random_pick(questions, records):
     """根据错误次数和错误率进行加权随机抽题"""

@@ -3,6 +3,7 @@
 """PyQt6 主刷题窗口。"""
 
 import os
+import re
 from functools import partial
 
 from PyQt6.QtCore import Qt
@@ -24,25 +25,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from parser import _mask_blank_question_text
-from question import _format_answer_text
-from question_bank import (
-    _ensure_question_identity_fields,
-    apply_manual_question_edits,
-    get_record,
-    load_manual_question_edits,
-    load_records,
-    save_records,
-    update_record,
-    upsert_manual_question_edit,
-)
-from session import weighted_random_pick
-from ui_pyqt_dialogs import (
-    show_frequency_stats_dialog,
-    show_manual_edits_dialog,
-    show_question_edit_dialog,
-)
-from ui_pyqt_dialogs import TYPE_LABELS
+from src.core import *
+from src.ui import *
 
 
 def normalize_keyboard_text(text): # 规范化键盘输入，兼容全角字母。
@@ -80,7 +64,7 @@ class QuizWindow(QMainWindow):
         self.questions = list(questions or [])
         self.manual_edits = load_manual_question_edits()
         for q in self.questions:
-            _ensure_question_identity_fields(q)
+            ensure_question_identity_fields(q)
         apply_manual_question_edits(self.questions, self.manual_edits)
 
         self.question_map = {q.get("id"): q for q in self.questions}
@@ -96,9 +80,37 @@ class QuizWindow(QMainWindow):
         self.option_group = None
 
         self.setWindowTitle("SuperReciteHelper")
-        self.resize(960, 720)
+        self.ui_scale = self._get_ui_scale()
+        self._apply_scaled_window_geometry()
         self._build_ui()
         self._show_welcome()
+
+    def _get_ui_scale(self):
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return 1.0
+        geo = screen.availableGeometry()
+        dpr = screen.devicePixelRatio()
+        physical_w = geo.width() * dpr
+        physical_h = geo.height() * dpr
+        scale_w = physical_w / 1920
+        scale_h = physical_h / 1080
+        resolution_scale = (scale_w + scale_h) / 2
+        dpi_scale = screen.logicalDotsPerInch() / 96
+        return max(1.0, min(1.5, max(resolution_scale, dpi_scale)))
+
+    def _px(self, value):
+        return max(1, int(round(value * self.ui_scale)))
+
+    def _style(self, style_text):
+        def repl(match):
+            return f"{self._px(float(match.group(1)))}px"
+
+        return re.sub(r'(\d+(?:\.\d+)?)px', repl, style_text)
+
+    def _apply_scaled_window_geometry(self):
+        self.resize(960, 720)
+        self.setMinimumSize(760, 560)
 
     def _build_ui(self):
         root = QWidget()
@@ -110,11 +122,11 @@ class QuizWindow(QMainWindow):
         header = QWidget()
         header.setStyleSheet("background: white; border-bottom: 1px solid #e4e7ec;")
         hl = QHBoxLayout(header)
-        hl.setContentsMargins(20, 10, 16, 10)
-        hl.setSpacing(4)
+        hl.setContentsMargins(self._px(20), self._px(10), self._px(16), self._px(10))
+        hl.setSpacing(self._px(4))
 
         self.source_label = QLabel(f"题库：{self.source_name}")
-        self.source_label.setStyleSheet("font-size: 13px; color: #667085;")
+        self.source_label.setStyleSheet(self._style("font-size: 13px; color: #667085;"))
         hl.addWidget(self.source_label)
         hl.addStretch(1)
 
@@ -123,7 +135,7 @@ class QuizWindow(QMainWindow):
         self.stats_btn = QPushButton("📊  统计")
         self.reset_btn = QPushButton("↺  重置")
         for btn in (self.edit_btn, self.manage_edits_btn, self.stats_btn, self.reset_btn):
-            btn.setStyleSheet(_BTN_HEADER)
+            btn.setStyleSheet(self._style(_BTN_HEADER))
             hl.addWidget(btn)
         self.edit_btn.clicked.connect(self.edit_current_question)
         self.manage_edits_btn.clicked.connect(self.manage_manual_edits)
@@ -133,26 +145,26 @@ class QuizWindow(QMainWindow):
 
         # ── Progress row ─────────────────────────────────────────────
         prog_row = QWidget()
-        prog_row.setStyleSheet("background: white; padding-bottom: 2px;")
+        prog_row.setStyleSheet(self._style("background: white; padding-bottom: 2px;"))
         pl = QHBoxLayout(prog_row)
-        pl.setContentsMargins(20, 6, 20, 10)
-        pl.setSpacing(10)
+        pl.setContentsMargins(self._px(20), self._px(6), self._px(20), self._px(10))
+        pl.setSpacing(self._px(10))
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(False)
-        self.progress_bar.setFixedHeight(5)
-        self.progress_bar.setStyleSheet(
+        self.progress_bar.setFixedHeight(self._px(5))
+        self.progress_bar.setStyleSheet(self._style(
             "QProgressBar { background: #f2f4f7; border-radius: 3px; border: none; }"
             "QProgressBar::chunk { background: #1570ef; border-radius: 3px; }"
-        )
+        ))
         pl.addWidget(self.progress_bar, 1)
 
         self.progress_label = QLabel("0/0")
-        self.progress_label.setStyleSheet("font-size: 13px; color: #344054;")
+        self.progress_label.setStyleSheet(self._style("font-size: 13px; color: #344054;"))
         pl.addWidget(self.progress_label)
 
         self.accuracy_label = QLabel("正确率 —")
-        self.accuracy_label.setStyleSheet("font-size: 13px; color: #667085;")
+        self.accuracy_label.setStyleSheet(self._style("font-size: 13px; color: #667085;"))
         pl.addWidget(self.accuracy_label)
         root_layout.addWidget(prog_row)
 
@@ -165,25 +177,25 @@ class QuizWindow(QMainWindow):
         content = QWidget()
         content.setStyleSheet("background: #f9fafb;")
         self.content_layout = QVBoxLayout(content)
-        self.content_layout.setContentsMargins(28, 28, 28, 28)
-        self.content_layout.setSpacing(14)
+        self.content_layout.setContentsMargins(self._px(28), self._px(28), self._px(28), self._px(28))
+        self.content_layout.setSpacing(self._px(14))
 
         # Question header row
         q_header = QHBoxLayout()
-        q_header.setSpacing(8)
+        q_header.setSpacing(self._px(8))
         self.title_label = QLabel()
-        self.title_label.setStyleSheet("font-size: 20px; font-weight: 700; color: #101828;")
+        self.title_label.setStyleSheet(self._style("font-size: 20px; font-weight: 700; color: #101828;"))
         q_header.addWidget(self.title_label)
 
         self.type_badge = QLabel()
-        self.type_badge.setStyleSheet(
+        self.type_badge.setStyleSheet(self._style(
             "background: #eff8ff; color: #1570ef; font-size: 12px; font-weight: 600;"
             " padding: 2px 10px; border-radius: 10px;"
-        )
+        ))
         q_header.addWidget(self.type_badge)
 
         self.history_label = QLabel()
-        self.history_label.setStyleSheet("font-size: 13px; color: #98a2b3;")
+        self.history_label.setStyleSheet(self._style("font-size: 13px; color: #98a2b3;"))
         q_header.addWidget(self.history_label)
         q_header.addStretch(1)
         self.content_layout.addLayout(q_header)
@@ -192,10 +204,10 @@ class QuizWindow(QMainWindow):
         self.question_label = QLabel()
         self.question_label.setWordWrap(True)
         self.question_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self.question_label.setStyleSheet(
+        self.question_label.setStyleSheet(self._style(
             "background: #f2f4f7; border-radius: 10px; padding: 16px 18px;"
             " font-size: 15px; color: #101828;"
-        )
+        ))
         self.content_layout.addWidget(self.question_label)
 
         # Options container
@@ -203,13 +215,13 @@ class QuizWindow(QMainWindow):
         self.options_container.setStyleSheet("background: transparent;")
         self.options_layout = QVBoxLayout(self.options_container)
         self.options_layout.setContentsMargins(0, 0, 0, 0)
-        self.options_layout.setSpacing(8)
+        self.options_layout.setSpacing(self._px(8))
         self.content_layout.addWidget(self.options_container)
 
         # Result label
         self.result_label = QLabel()
         self.result_label.setWordWrap(True)
-        self.result_label.setStyleSheet("font-size: 14px;")
+        self.result_label.setStyleSheet(self._style("font-size: 14px;"))
         self.content_layout.addWidget(self.result_label)
 
         self.content_layout.addStretch(1)
@@ -220,32 +232,32 @@ class QuizWindow(QMainWindow):
         bottom = QWidget()
         bottom.setStyleSheet("background: white; border-top: 1px solid #e4e7ec;")
         bl = QHBoxLayout(bottom)
-        bl.setContentsMargins(20, 10, 20, 10)
-        bl.setSpacing(8)
+        bl.setContentsMargins(self._px(20), self._px(10), self._px(20), self._px(10))
+        bl.setSpacing(self._px(8))
 
         self.hint_label = QLabel("按 A–D 选择，Enter 提交")
-        self.hint_label.setStyleSheet("font-size: 13px; color: #b0b7c3;")
+        self.hint_label.setStyleSheet(self._style("font-size: 13px; color: #b0b7c3;"))
         bl.addWidget(self.hint_label)
 
         self.keyboard_entry = QLineEdit()
         self.keyboard_entry.setPlaceholderText("键盘输入")
-        self.keyboard_entry.setFixedWidth(88)
-        self.keyboard_entry.setStyleSheet(
+        self.keyboard_entry.setFixedWidth(self._px(88))
+        self.keyboard_entry.setStyleSheet(self._style(
             "border: 1px solid #d0d5dd; border-radius: 6px; padding: 5px 10px;"
             " font-size: 13px; color: #344054; background: white;"
-        )
+        ))
         self.keyboard_entry.returnPressed.connect(self._process_keyboard_enter)
         bl.addWidget(self.keyboard_entry)
 
         bl.addStretch(1)
 
         self.next_btn = QPushButton("下一题")
-        self.next_btn.setStyleSheet(_BTN_GHOST)
+        self.next_btn.setStyleSheet(self._style(_BTN_GHOST))
         self.next_btn.clicked.connect(self.next_question)
         bl.addWidget(self.next_btn)
 
         self.submit_btn = QPushButton("提交答案")
-        self.submit_btn.setStyleSheet(_BTN_PRIMARY)
+        self.submit_btn.setStyleSheet(self._style(_BTN_PRIMARY))
         self.submit_btn.clicked.connect(self.submit_answer)
         bl.addWidget(self.submit_btn)
 
@@ -305,26 +317,26 @@ class QuizWindow(QMainWindow):
 
     def _make_option_card(self, key, text, q_type):
         card = QFrame()
-        card.setStyleSheet(_CARD_DEFAULT)
+        card.setStyleSheet(self._style(_CARD_DEFAULT))
         card.setCursor(Qt.CursorShape.PointingHandCursor)
 
         card_layout = QHBoxLayout(card)
-        card_layout.setContentsMargins(14, 10, 14, 10)
-        card_layout.setSpacing(12)
+        card_layout.setContentsMargins(self._px(14), self._px(10), self._px(14), self._px(10))
+        card_layout.setSpacing(self._px(12))
 
         if q_type in ("single", "judge"):
             btn = QRadioButton()
         else:
             btn = QCheckBox()
-        btn.setStyleSheet(
+        btn.setStyleSheet(self._style(
             "QRadioButton::indicator { width: 17px; height: 17px; }"
             " QCheckBox::indicator { width: 17px; height: 17px; }"
-        )
+        ))
         card_layout.addWidget(btn)
 
         lbl = QLabel(f"{key}. {text}")
         lbl.setWordWrap(True)
-        lbl.setStyleSheet("font-size: 14px; color: #101828; background: transparent; border: none;")
+        lbl.setStyleSheet(self._style("font-size: 14px; color: #101828; background: transparent; border: none;"))
         card_layout.addWidget(lbl, 1)
 
         btn.toggled.connect(partial(self._on_option_toggled, key))
@@ -339,7 +351,7 @@ class QuizWindow(QMainWindow):
     def _on_option_toggled(self, key, checked):
         card = self.option_cards.get(key)
         if card and not self.submitted:
-            card.setStyleSheet(_CARD_SELECTED if checked else _CARD_DEFAULT)
+            card.setStyleSheet(self._style(_CARD_SELECTED if checked else _CARD_DEFAULT))
 
     def _display_question(self):
         q = self.current_q
@@ -354,7 +366,7 @@ class QuizWindow(QMainWindow):
 
         question_text = str(q.get("text", "") or "")
         if q_type == "blank":
-            question_text = _mask_blank_question_text(question_text, q.get("answer", ""))
+            question_text = mask_blank_question_text(question_text, q.get("answer", ""))
         self.question_label.setText(question_text)
 
         rec = get_record(self.records, q)
@@ -391,7 +403,7 @@ class QuizWindow(QMainWindow):
             self.hint_label.setText("按字母多选（如 ABC），Enter 提交")
             self.keyboard_entry.setPlaceholderText("输入 ABC")
         else:
-            self.result_label.setStyleSheet("font-size: 14px; color: #667085;")
+            self.result_label.setStyleSheet(self._style("font-size: 14px; color: #667085;"))
             self.result_label.setText('先自行作答，然后点击"显示答案"。')
             self.submit_btn.setText("显示答案")
             self.submit_btn.setEnabled(True)
@@ -411,8 +423,8 @@ class QuizWindow(QMainWindow):
         if q_type in ("blank", "short"):
             if not self.answer_revealed:
                 self.answer_revealed = True
-                self.result_label.setStyleSheet("font-size: 14px; color: #344054;")
-                self.result_label.setText(f"参考答案：{_format_answer_text(q.get('answer'))}")
+                self.result_label.setStyleSheet(self._style("font-size: 14px; color: #344054;"))
+                self.result_label.setText(f"参考答案：{format_answer_text(q.get('answer'))}")
                 self._add_subjective_buttons()
                 self.submit_btn.setEnabled(False)
             return
@@ -442,23 +454,23 @@ class QuizWindow(QMainWindow):
         for key, card in self.option_cards.items():
             lbl = card.findChild(QLabel)
             if key in correct:
-                card.setStyleSheet(_CARD_CORRECT)
+                card.setStyleSheet(self._style(_CARD_CORRECT))
                 if lbl:
-                    lbl.setStyleSheet("font-size: 14px; color: #027a48; font-weight: 600; background: transparent; border: none;")
+                    lbl.setStyleSheet(self._style("font-size: 14px; color: #027a48; font-weight: 600; background: transparent; border: none;"))
             elif key in selected:
-                card.setStyleSheet(_CARD_WRONG)
+                card.setStyleSheet(self._style(_CARD_WRONG))
                 if lbl:
-                    lbl.setStyleSheet("font-size: 14px; color: #b42318; font-weight: 600; background: transparent; border: none;")
+                    lbl.setStyleSheet(self._style("font-size: 14px; color: #b42318; font-weight: 600; background: transparent; border: none;"))
             else:
-                card.setStyleSheet(_CARD_DIMMED)
+                card.setStyleSheet(self._style(_CARD_DIMMED))
                 if lbl:
-                    lbl.setStyleSheet("font-size: 14px; color: #98a2b3; background: transparent; border: none;")
+                    lbl.setStyleSheet(self._style("font-size: 14px; color: #98a2b3; background: transparent; border: none;"))
 
         if is_correct:
-            self.result_label.setStyleSheet("font-size: 14px; color: #027a48; font-weight: 700;")
+            self.result_label.setStyleSheet(self._style("font-size: 14px; color: #027a48; font-weight: 700;"))
             self.result_label.setText("回答正确！")
         else:
-            self.result_label.setStyleSheet("font-size: 14px; color: #b42318; font-weight: 700;")
+            self.result_label.setStyleSheet(self._style("font-size: 14px; color: #b42318; font-weight: 700;"))
             self.result_label.setText(f"回答错误。正确答案：{''.join(sorted(correct))}")
 
         rec = get_record(self.records, self.current_q)
@@ -470,28 +482,28 @@ class QuizWindow(QMainWindow):
         row = QWidget()
         row.setStyleSheet("background: transparent;")
         layout = QHBoxLayout(row)
-        layout.setContentsMargins(0, 4, 0, 0)
-        layout.setSpacing(10)
+        layout.setContentsMargins(0, self._px(4), 0, 0)
+        layout.setSpacing(self._px(10))
 
         correct_btn = QPushButton("✓  我答对了")
-        correct_btn.setStyleSheet("""
+        correct_btn.setStyleSheet(self._style("""
             QPushButton {
                 background: #ecfdf3; color: #027a48; border: 1.5px solid #6ce9a6;
                 border-radius: 8px; padding: 7px 18px; font-size: 13px; font-weight: 600;
             }
             QPushButton:hover { background: #d1fae5; }
-        """)
+        """))
         correct_btn.clicked.connect(lambda: self._submit_subjective_result(True))
         layout.addWidget(correct_btn)
 
         wrong_btn = QPushButton("✗  我答错了")
-        wrong_btn.setStyleSheet("""
+        wrong_btn.setStyleSheet(self._style("""
             QPushButton {
                 background: #fff1f0; color: #b42318; border: 1.5px solid #fca5a5;
                 border-radius: 8px; padding: 7px 18px; font-size: 13px; font-weight: 600;
             }
             QPushButton:hover { background: #ffe4e6; }
-        """)
+        """))
         wrong_btn.clicked.connect(lambda: self._submit_subjective_result(False))
         layout.addWidget(wrong_btn)
 
@@ -506,12 +518,12 @@ class QuizWindow(QMainWindow):
         self.submitted = True
         self._update_stats()
 
-        answer = _format_answer_text(self.current_q.get("answer"))
+        answer = format_answer_text(self.current_q.get("answer"))
         if is_correct:
-            self.result_label.setStyleSheet("font-size: 14px; color: #027a48; font-weight: 700;")
+            self.result_label.setStyleSheet(self._style("font-size: 14px; color: #027a48; font-weight: 700;"))
             self.result_label.setText(f"参考答案：{answer}\n已记录：答对。")
         else:
-            self.result_label.setStyleSheet("font-size: 14px; color: #b42318; font-weight: 700;")
+            self.result_label.setStyleSheet(self._style("font-size: 14px; color: #b42318; font-weight: 700;"))
             self.result_label.setText(f"参考答案：{answer}\n已记录：答错。")
 
         for widget in self.option_widgets.values():
@@ -620,7 +632,7 @@ class QuizWindow(QMainWindow):
             q_type = self.current_q.get("type")
             if q_type in ("single", "multi", "judge"):
                 if not self._select_objective_by_keyboard(token):
-                    self.result_label.setStyleSheet("font-size: 14px; color: #b54708;")
+                    self.result_label.setStyleSheet(self._style("font-size: 14px; color: #b54708;"))
                     self.result_label.setText("未识别到有效选项，请输入题目存在的字母。")
                     return
                 self.submit_answer()
@@ -628,7 +640,7 @@ class QuizWindow(QMainWindow):
             if q_type in ("blank", "short"):
                 if self._submit_subjective_by_keyboard(token):
                     return
-                self.result_label.setStyleSheet("font-size: 14px; color: #b54708;")
+                self.result_label.setStyleSheet(self._style("font-size: 14px; color: #b54708;"))
                 self.result_label.setText("主观题请在显示答案后输入 t/f 自评。")
                 return
 
@@ -654,4 +666,4 @@ class QuizWindow(QMainWindow):
         self.option_widgets = {}
         self.option_cards = {}
         self.option_group = None
-        self.result_label.setStyleSheet("font-size: 14px;")
+        self.result_label.setStyleSheet(self._style("font-size: 14px;"))
