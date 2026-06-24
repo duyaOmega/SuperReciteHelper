@@ -69,7 +69,7 @@ def save_manual_question_edits(edits):
     except Exception:
         pass
 
-def _ensure_question_identity_fields(question):
+def ensure_question_identity_fields(question):
     """确保题目具备稳定键与原始内容快照。"""
     # _base_key: 由“原始题干+选项+题型”计算出的稳定主键，手动编辑前后都不变。
     if '_base_key' not in question or not question.get('_base_key'):
@@ -94,7 +94,7 @@ def _ensure_question_identity_fields(question):
 def apply_manual_question_edits(questions, edits):
     """将持久化编辑应用到当前题集（严格按 base_key 匹配）。"""
     for q in questions:
-        _ensure_question_identity_fields(q)
+        ensure_question_identity_fields(q)
         # base_key: 当前题目的稳定身份标识，用于命中 edits 中的覆盖数据。
         base_key = q.get('_base_key')
         if not base_key or base_key not in edits:
@@ -112,7 +112,7 @@ def apply_manual_question_edits(questions, edits):
 
 def upsert_manual_question_edit(edits, question):
     """写入某题的手动修改（以原始 base_key 为主键）。"""
-    _ensure_question_identity_fields(question)
+    ensure_question_identity_fields(question)
     # key: 手动编辑记录的主键，固定使用 _base_key 防止题号变化导致丢记录。
     key = question['_base_key']
 

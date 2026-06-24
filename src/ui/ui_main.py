@@ -12,33 +12,12 @@
 import tkinter as tk
 from tkinter import messagebox, font as tkfont, filedialog, ttk
 import re
-import json
 import os
-import random
-import math
-import hashlib
-from datetime import datetime
 import ctypes
-import tempfile
-import zipfile
 import xml.etree.ElementTree as ET
 
-from parser import _clean_pdf_judge_text_noise, _mask_blank_question_text
-from question import _format_answer_text, _show_question_edit_dialog
-from question_bank import (
-    _ensure_question_identity_fields,
-    apply_manual_question_edits,
-    get_record,
-    load_app_state,
-    load_manual_question_edits,
-    load_records,
-    save_app_state,
-    save_manual_question_edits,
-    save_records,
-    update_record,
-    upsert_manual_question_edit,
-)
-from session import weighted_random_pick
+from src.core import *
+from src.ui import show_question_edit_dialog
 
 class QuizApp:
     def __init__(self, root, questions, source_path=''):
@@ -48,7 +27,7 @@ class QuizApp:
         self.questions = questions
         self.manual_edits = load_manual_question_edits()
         for q in self.questions:
-            _ensure_question_identity_fields(q)
+            ensure_question_identity_fields(q)
         apply_manual_question_edits(self.questions, self.manual_edits)
         # question_map: 题号 -> 题目对象，供统计窗口“按题号快速回查详情”。
         self.question_map = {q['id']: q for q in questions}
@@ -403,7 +382,7 @@ class QuizApp:
         self.q_type_label.config(text=type_map.get(q['type'], ''))
         display_text = q['text']
         if q.get('type') == 'blank':
-            display_text = _mask_blank_question_text(q['text'], q.get('answer', ''))
+            display_text = mask_blank_question_text(q['text'], q.get('answer', ''))
         self.q_text_label.config(text=display_text)
         self.result_label.config(text="")
 
@@ -618,7 +597,7 @@ class QuizApp:
 
     def _ask_edit_question_and_answer(self, q):
         """弹窗编辑题干与答案。"""
-        edited = _show_question_edit_dialog(self.root, q, title='编辑当前题（题目+答案）')
+        edited = show_question_edit_dialog(self.root, q, title='编辑当前题（题目+答案）')
         if not edited:
             return False
 
@@ -703,7 +682,7 @@ class QuizApp:
                 tree.delete(item)
 
             for i, (k, v) in enumerate(sorted(self.manual_edits.items(), key=lambda x: str(x[1].get('updated_at', '')), reverse=True), 1):
-                ans = _format_answer_text(v.get('answer', ''))
+                ans = format_answer_text(v.get('answer', ''))
                 preview = str(v.get('preview', '') or '')
                 tree.insert('', 'end', iid=k, values=(
                     i,
@@ -735,7 +714,7 @@ class QuizApp:
             save_manual_question_edits(self.manual_edits)
 
             for q in self.questions:
-                _ensure_question_identity_fields(q)
+                ensure_question_identity_fields(q)
                 if q.get('_base_key') == key:
                     q['type'] = str(payload.get('orig_type', q.get('_orig_type', q.get('type', ''))))
                     q['options'] = dict(payload.get('orig_options', q.get('_orig_options', q.get('options', {}))) or {})
@@ -758,7 +737,7 @@ class QuizApp:
             save_manual_question_edits(self.manual_edits)
 
             for q in self.questions:
-                _ensure_question_identity_fields(q)
+                ensure_question_identity_fields(q)
                 key = q.get('_base_key')
                 if key in deleted:
                     payload = deleted[key]
@@ -1284,7 +1263,7 @@ def show_import_preview(root, candidates, source_path):
     manual_edits = load_manual_question_edits()
     for _, qs, _ in candidates:
         for q in qs:
-            _ensure_question_identity_fields(q)
+            ensure_question_identity_fields(q)
         apply_manual_question_edits(qs, manual_edits)
 
     win = tk.Toplevel(root)
@@ -1397,7 +1376,7 @@ def show_import_preview(root, candidates, source_path):
             messagebox.showwarning('提示', '请先在预览表中选择一题。', parent=win)
             return
 
-        edited = _show_question_edit_dialog(win, q, title='修改所选题（题目+答案）')
+        edited = show_question_edit_dialog(win, q, title='修改所选题（题目+答案）')
         if not edited:
             return
 

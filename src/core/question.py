@@ -4,15 +4,15 @@
 
 import re
 
-from parser import _extract_choice_answer, _normalize_answer_text
+from .parser import _extract_choice_answer, _normalize_answer_text
 
-def _format_answer_text(answer_value):
+def format_answer_text(answer_value):
     """将答案值统一格式化为可展示字符串。"""
     if isinstance(answer_value, list):
         return ''.join(answer_value)
     return str(answer_value or '')
 
-def _parse_manual_answer_for_question(question, raw_text, target_type=None, options_override=None):
+def parse_manual_answer_for_question(question, raw_text, target_type=None, options_override=None):
     """按题型校验并解析手动输入答案。"""
     # q_type: 本次按什么题型解析答案（可由 target_type 临时覆盖原题型）。
     q_type = target_type or question.get('type')
@@ -57,7 +57,7 @@ def _parse_manual_answer_for_question(question, raw_text, target_type=None, opti
 
     return None, '暂不支持该题型的答案编辑。'
 
-def _format_options_for_edit(options):
+def format_options_for_edit(options):
     """把选项字典转成多行可编辑文本。"""
     opt = options or {}
     lines = []
@@ -65,7 +65,7 @@ def _format_options_for_edit(options):
         lines.append(f'{k}: {opt.get(k, "")}')
     return '\n'.join(lines)
 
-def _parse_manual_options_text(raw_text):
+def parse_manual_options_text(raw_text):
     """解析手动输入的选项文本，格式示例：A: xxx"""
     lines = [l.strip() for l in str(raw_text or '').splitlines() if l.strip()]
     if not lines:

@@ -22,17 +22,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from question import (
-    _format_answer_text,
-    _format_options_for_edit,
-    _parse_manual_answer_for_question,
-    _parse_manual_options_text,
-)
-from question_bank import (
-    _ensure_question_identity_fields,
-    get_record,
-    save_manual_question_edits,
-)
+from src.core import *
+
 TYPE_LABELS = {
     "single": "单选题",
     "multi":  "多选题",
@@ -149,7 +140,7 @@ def show_question_edit_dialog(parent, question, title="编辑当前题"):
 
     # ── 答案 ──
     answer_line = QLineEdit()
-    answer_line.setText(_format_answer_text(q.get("answer")))
+    answer_line.setText(format_answer_text(q.get("answer")))
     answer_line.setStyleSheet(_INPUT_STYLE)
     _section("答案", answer_line, form)
 
@@ -291,7 +282,7 @@ def show_question_edit_dialog(parent, question, title="编辑当前题"):
         prev_type[0] = target_type
 
     # Init existing options
-    existing = _format_options_for_edit(q.get("options") or {})
+    existing = format_options_for_edit(q.get("options") or {})
     for line in existing.split("\n"):
         line = line.strip()
         if not line:
@@ -320,14 +311,14 @@ def show_question_edit_dialog(parent, question, title="编辑当前题"):
                 QMessageBox.warning(dialog, "格式错误", "请至少添加一个选项。")
                 return
             opts_text = "\n".join(f"{letters[i]}: {v}" for i, v in enumerate(values))
-            target_options, opt_err = _parse_manual_options_text(opts_text)
+            target_options, opt_err = parse_manual_options_text(opts_text)
             if opt_err:
                 QMessageBox.warning(dialog, "格式错误", opt_err)
                 return
         else:
             target_options = {}
 
-        parsed_answer, err = _parse_manual_answer_for_question(
+        parsed_answer, err = parse_manual_answer_for_question(
             q,
             answer_line.text().strip(),
             target_type=target_type,
@@ -386,7 +377,7 @@ def show_manual_edits_dialog(parent, questions, manual_edits, current_q=None, on
         table.setRowCount(len(items))
         for row, (key, payload) in enumerate(items):
             key_by_row.append(key)
-            answer = _format_answer_text((payload or {}).get("answer", ""))
+            answer = format_answer_text((payload or {}).get("answer", ""))
             values = [
                 str(row + 1),
                 str((payload or {}).get("type", "")),
@@ -407,7 +398,7 @@ def show_manual_edits_dialog(parent, questions, manual_edits, current_q=None, on
 
     def restore_question_from_payload(key, payload):
         for q in questions:
-            _ensure_question_identity_fields(q)
+            ensure_question_identity_fields(q)
             if q.get("_base_key") == key:
                 q["type"] = str(payload.get("orig_type", q.get("_orig_type", q.get("type", ""))))
                 q["options"] = dict(payload.get("orig_options", q.get("_orig_options", q.get("options", {}))) or {})
@@ -590,7 +581,7 @@ def show_frequency_stats_dialog(parent, questions, records, question_map):
         if not q:
             QMessageBox.warning(dialog, "错误", "未找到题目详情。")
             return
-        answer = _format_answer_text(q.get("answer"))
+        answer = format_answer_text(q.get("answer"))
         options = q.get("options") or {}
         option_lines = "\n".join(f"{key}. {options[key]}" for key in sorted(options.keys()))
         detail = f"题干：\n{q.get('text', '')}\n\n"
