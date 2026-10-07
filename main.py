@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from src.core.parser import build_parse_candidates
 from src.core.question_bank import load_app_state, save_app_state
+from src.ui import theme
 from src.ui.ui_pyqt import QuizWindow
 
 
@@ -41,6 +42,7 @@ def _load_questions(file_path):
 def main():
     """应用主入口：选择题库、解析并启动 PyQt 刷题界面。"""
     app = QApplication(sys.argv)
+    theme.apply(app, theme.initial(app, load_app_state().get("theme")))
 
     file_path = _choose_question_file()
     if not file_path:

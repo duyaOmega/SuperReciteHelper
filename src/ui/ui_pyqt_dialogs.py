@@ -3,6 +3,7 @@
 """PyQt 弹窗集合。"""
 
 import re
+from string import Template
 
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -23,6 +24,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.core import *
+from src.ui import theme
 
 TYPE_LABELS = {
     "single": "单选题",
@@ -32,44 +34,82 @@ TYPE_LABELS = {
     "short":  "简答题",
 }
 
-_DIALOG_BG = "background: white;"
-_INPUT_STYLE = (
-    "border: 1px solid #d0d5dd; border-radius: 8px; padding: 8px 12px;"
-    " font-size: 14px; color: #101828; background: white;"
-)
-_LABEL_STYLE = "font-size: 13px; font-weight: 600; color: #344054;"
-_BTN_CANCEL = (
-    "QPushButton { background: white; color: #344054; border: 1px solid #d0d5dd;"
-    " border-radius: 8px; padding: 8px 20px; font-size: 14px; font-weight: 500; }"
-    "QPushButton:hover { background: #f9fafb; }"
-)
-_BTN_PRIMARY = (
-    "QPushButton { background: #1570ef; color: white; border: none;"
-    " border-radius: 8px; padding: 8px 24px; font-size: 14px; font-weight: 600; }"
-    "QPushButton:hover { background: #175cd3; }"
-)
-_BTN_GHOST = (
-    "QPushButton { background: #f2f4f7; color: #344054; border: 1px solid #d0d5dd;"
-    " border-radius: 8px; padding: 7px 14px; font-size: 13px; }"
-    "QPushButton:hover { background: #e4e7ec; }"
-)
-_BTN_DEL = (
-    "QPushButton { background: #fff1f0; color: #b42318; border: none;"
-    " border-radius: 6px; font-size: 18px; font-weight: 700; }"
-    "QPushButton:hover { background: #ffe4e6; }"
-)
-_BTN_ADD_OPT = (
-    "QPushButton { background: transparent; color: #1570ef;"
-    " border: 1.5px dashed #b2ccff; border-radius: 8px;"
-    " padding: 7px 14px; font-size: 13px; font-weight: 600; }"
-    "QPushButton:hover { background: #eff8ff; }"
-)
+#--------------------弹窗样式模板（按主题 token 生成）-------------------------------
+_T = Template
+
+_STYLE_TEMPLATES = {
+    "dialog_bg": _T("background: $surface;"),
+    "title_bar": _T("background: $surface; border-bottom: 1px solid $border;"),
+    "title_label": _T("font-size: 16px; font-weight: 700; color: $text;"),
+    "close_x": _T(
+        "QPushButton { background: transparent; color: $faint; border: none; font-size: 20px; }"
+        "QPushButton:hover { color: $text_secondary; }"
+    ),
+    "input": _T(
+        "border: 1px solid $input_border; border-radius: 8px; padding: 8px 12px;"
+        " font-size: 14px; color: $text; background: $surface;"
+    ),
+    "label": _T("font-size: 13px; font-weight: 600; color: $text_secondary;"),
+    "hint": _T("font-size: 12px; color: $faint;"),
+    "opt_prefix": _T("font-size: 14px; color: $muted; font-weight: 600;"),
+    "combo": _T(
+        "QComboBox { border: 1px solid $input_border; border-radius: 8px; padding: 7px 12px;"
+        " font-size: 14px; color: $text; background: $surface; }"
+        "QComboBox::drop-down { border: none; width: 24px; }"
+    ),
+    "combo_small": _T(
+        "QComboBox { border: 1px solid $input_border; border-radius: 6px; padding: 5px 10px;"
+        " font-size: 13px; color: $text; background: $surface; }"
+        "QComboBox::drop-down { border: none; }"
+    ),
+    "table": _T(
+        "QTableWidget { border: 1px solid $border; border-radius: 8px; gridline-color: $grid;"
+        " background: $surface; color: $text; }"
+        "QHeaderView::section { background: $header_bg; color: $muted; font-size: 12px;"
+        " padding: 6px; border: none; border-bottom: 1px solid $border; }"
+    ),
+    "summary": _T("font-size: 13px; color: $text_secondary;"),
+    "ctrl_label": _T("font-size: 13px; color: $muted;"),
+    "checkbox": _T("font-size: 13px; color: $text_secondary;"),
+    "btn_cancel": _T(
+        "QPushButton { background: $surface; color: $text_secondary; border: 1px solid $input_border;"
+        " border-radius: 8px; padding: 8px 20px; font-size: 14px; font-weight: 500; }"
+        "QPushButton:hover { background: $header_bg; }"
+    ),
+    "btn_primary": _T(
+        "QPushButton { background: $primary; color: white; border: none;"
+        " border-radius: 8px; padding: 8px 24px; font-size: 14px; font-weight: 600; }"
+        "QPushButton:hover { background: $primary_hover; }"
+    ),
+    "btn_ghost": _T(
+        "QPushButton { background: $surface_alt; color: $text_secondary; border: 1px solid $input_border;"
+        " border-radius: 8px; padding: 7px 14px; font-size: 13px; }"
+        "QPushButton:hover { background: $surface_hover; }"
+    ),
+    "btn_del": _T(
+        "QPushButton { background: $err_bg; color: $err_text; border: none;"
+        " border-radius: 6px; font-size: 18px; font-weight: 700; }"
+        "QPushButton:hover { background: $err_bg_hover; }"
+    ),
+    "btn_add_opt": _T(
+        "QPushButton { background: transparent; color: $primary;"
+        " border: 1.5px dashed $add_border; border-radius: 8px;"
+        " padding: 7px 14px; font-size: 13px; font-weight: 600; }"
+        "QPushButton:hover { background: $accent_bg; }"
+    ),
+    "footer": _T("background: $surface; border-top: 1px solid $border;"),
+}
 
 
-def _section(label_text, widget, parent_layout):
+def dialog_styles(tk):
+    """按当前主题 token 生成弹窗使用的全部样式字符串。"""
+    return {key: tpl.substitute(tk) for key, tpl in _STYLE_TEMPLATES.items()}
+
+
+def _section(label_text, widget, parent_layout, styles):
     """Add a labeled section to a vertical layout."""
     lbl = QLabel(label_text)
-    lbl.setStyleSheet(_LABEL_STYLE)
+    lbl.setStyleSheet(styles["label"])
     parent_layout.addWidget(lbl)
     parent_layout.addWidget(widget)
 
@@ -77,10 +117,11 @@ def _section(label_text, widget, parent_layout):
 def show_question_edit_dialog(parent, question, title="编辑当前题"):
     """编辑题目、题型、选项和答案。"""
     q = question or {}
+    st = dialog_styles(theme.tokens())
     dialog = QDialog(parent)
     dialog.setWindowTitle(title)
     dialog.resize(580, 680)
-    dialog.setStyleSheet(_DIALOG_BG)
+    dialog.setStyleSheet(st["dialog_bg"])
 
     outer = QVBoxLayout(dialog)
     outer.setContentsMargins(0, 0, 0, 0)
@@ -88,19 +129,16 @@ def show_question_edit_dialog(parent, question, title="编辑当前题"):
 
     # Title bar
     title_bar = QWidget()
-    title_bar.setStyleSheet("background: white; border-bottom: 1px solid #e4e7ec;")
+    title_bar.setStyleSheet(st["title_bar"])
     tb = QHBoxLayout(title_bar)
     tb.setContentsMargins(20, 14, 16, 14)
     title_lbl = QLabel(title)
-    title_lbl.setStyleSheet("font-size: 16px; font-weight: 700; color: #101828;")
+    title_lbl.setStyleSheet(st["title_label"])
     tb.addWidget(title_lbl)
     tb.addStretch(1)
     close_x = QPushButton("×")
     close_x.setFixedSize(28, 28)
-    close_x.setStyleSheet(
-        "QPushButton { background: transparent; color: #98a2b3; border: none; font-size: 20px; }"
-        "QPushButton:hover { color: #344054; }"
-    )
+    close_x.setStyleSheet(st["close_x"])
     close_x.clicked.connect(dialog.reject)
     tb.addWidget(close_x)
     outer.addWidget(title_bar)
@@ -110,7 +148,7 @@ def show_question_edit_dialog(parent, question, title="编辑当前题"):
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QScrollArea.Shape.NoFrame)
     form_w = QWidget()
-    form_w.setStyleSheet(_DIALOG_BG)
+    form_w.setStyleSheet(st["dialog_bg"])
     form = QVBoxLayout(form_w)
     form.setContentsMargins(20, 20, 20, 16)
     form.setSpacing(14)
@@ -124,25 +162,21 @@ def show_question_edit_dialog(parent, question, title="编辑当前题"):
     type_index = next((i for i, (_, v) in enumerate(type_items) if v == current_type), 4)
     type_combo.setCurrentIndex(type_index)
     type_combo.setFixedWidth(160)
-    type_combo.setStyleSheet(
-        "QComboBox { border: 1px solid #d0d5dd; border-radius: 8px; padding: 7px 12px;"
-        " font-size: 14px; background: white; }"
-        "QComboBox::drop-down { border: none; width: 24px; }"
-    )
-    _section("题型", type_combo, form)
+    type_combo.setStyleSheet(st["combo"])
+    _section("题型", type_combo, form, st)
 
     # ── 题目 ──
     question_text = QPlainTextEdit()
     question_text.setPlainText(str(q.get("text", "") or ""))
     question_text.setMinimumHeight(96)
-    question_text.setStyleSheet(_INPUT_STYLE)
-    _section("题目", question_text, form)
+    question_text.setStyleSheet(st["input"])
+    _section("题目", question_text, form, st)
 
     # ── 答案 ──
     answer_line = QLineEdit()
     answer_line.setText(format_answer_text(q.get("answer")))
-    answer_line.setStyleSheet(_INPUT_STYLE)
-    _section("答案", answer_line, form)
+    answer_line.setStyleSheet(st["input"])
+    _section("答案", answer_line, form, st)
 
     # ── 选项 ──
     opts_section = QWidget()
@@ -152,7 +186,7 @@ def show_question_edit_dialog(parent, question, title="编辑当前题"):
     opts_v.setSpacing(8)
 
     opts_lbl = QLabel("选项")
-    opts_lbl.setStyleSheet(_LABEL_STYLE)
+    opts_lbl.setStyleSheet(st["label"])
     opts_v.addWidget(opts_lbl)
 
     opts_rows_w = QWidget()
@@ -190,18 +224,18 @@ def show_question_edit_dialog(parent, question, title="编辑当前题"):
 
         prefix = QLabel(letter)
         prefix.setFixedWidth(22)
-        prefix.setStyleSheet("font-size: 14px; color: #667085; font-weight: 600;")
+        prefix.setStyleSheet(st["opt_prefix"])
         rl.addWidget(prefix)
 
         edit = QLineEdit(text)
         edit.setEnabled(enabled)
-        edit.setStyleSheet(_INPUT_STYLE)
+        edit.setStyleSheet(st["input"])
         rl.addWidget(edit, 1)
 
         del_btn = QPushButton("−")
         del_btn.setFixedSize(34, 34)
         del_btn.setEnabled(enabled)
-        del_btn.setStyleSheet(_BTN_DEL)
+        del_btn.setStyleSheet(st["btn_del"])
 
         def on_remove(*_, rw=row_w):
             for i, (*_, w) in enumerate(option_rows):
@@ -219,13 +253,13 @@ def show_question_edit_dialog(parent, question, title="编辑当前题"):
         option_rows.append((edit, del_btn, row_w))
 
     add_opt_btn = QPushButton("＋  添加选项")
-    add_opt_btn.setStyleSheet(_BTN_ADD_OPT)
+    add_opt_btn.setStyleSheet(st["btn_add_opt"])
     add_opt_btn.clicked.connect(lambda: add_option_row())
     opts_v.addWidget(add_opt_btn)
 
     hint_label = QLabel()
     hint_label.setWordWrap(True)
-    hint_label.setStyleSheet("font-size: 12px; color: #98a2b3;")
+    hint_label.setStyleSheet(st["hint"])
     opts_v.addWidget(hint_label)
 
     form.addWidget(opts_section)
@@ -235,17 +269,17 @@ def show_question_edit_dialog(parent, question, title="编辑当前题"):
 
     # Footer
     footer = QWidget()
-    footer.setStyleSheet("background: white; border-top: 1px solid #e4e7ec;")
+    footer.setStyleSheet(st["footer"])
     fl = QHBoxLayout(footer)
     fl.setContentsMargins(20, 12, 20, 12)
     fl.setSpacing(10)
     fl.addStretch(1)
     cancel_btn = QPushButton("取消")
-    cancel_btn.setStyleSheet(_BTN_CANCEL)
+    cancel_btn.setStyleSheet(st["btn_cancel"])
     cancel_btn.clicked.connect(dialog.reject)
     fl.addWidget(cancel_btn)
     save_btn = QPushButton("保存")
-    save_btn.setStyleSheet(_BTN_PRIMARY)
+    save_btn.setStyleSheet(st["btn_primary"])
     fl.addWidget(save_btn)
     outer.addWidget(footer)
 
@@ -338,17 +372,18 @@ def show_question_edit_dialog(parent, question, title="编辑当前题"):
 
 def show_manual_edits_dialog(parent, questions, manual_edits, current_q=None, on_refresh_current=None):
     """管理已保存的题目修改。"""
+    st = dialog_styles(theme.tokens())
     dialog = QDialog(parent)
     dialog.setWindowTitle("管理题目修改")
     dialog.resize(900, 520)
-    dialog.setStyleSheet(_DIALOG_BG)
+    dialog.setStyleSheet(st["dialog_bg"])
 
     layout = QVBoxLayout(dialog)
     layout.setContentsMargins(16, 16, 16, 16)
     layout.setSpacing(10)
 
     title = QLabel()
-    title.setStyleSheet("font-size: 14px; color: #344054;")
+    title.setStyleSheet(st["summary"])
     layout.addWidget(title)
 
     table = QTableWidget()
@@ -357,11 +392,7 @@ def show_manual_edits_dialog(parent, questions, manual_edits, current_q=None, on
     table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
     table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-    table.setStyleSheet(
-        "QTableWidget { border: 1px solid #e4e7ec; border-radius: 8px; gridline-color: #f2f4f7; }"
-        "QHeaderView::section { background: #f9fafb; color: #667085; font-size: 12px;"
-        " padding: 6px; border: none; border-bottom: 1px solid #e4e7ec; }"
-    )
+    table.setStyleSheet(st["table"])
     layout.addWidget(table, 1)
 
     key_by_row = []
@@ -437,17 +468,17 @@ def show_manual_edits_dialog(parent, questions, manual_edits, current_q=None, on
 
     button_row = QHBoxLayout()
     restore_btn = QPushButton("恢复所选默认")
-    restore_btn.setStyleSheet(_BTN_GHOST)
+    restore_btn.setStyleSheet(st["btn_ghost"])
     restore_btn.clicked.connect(restore_selected)
     button_row.addWidget(restore_btn)
 
     clear_btn = QPushButton("清空全部修改")
-    clear_btn.setStyleSheet(_BTN_GHOST)
+    clear_btn.setStyleSheet(st["btn_ghost"])
     clear_btn.clicked.connect(clear_all)
     button_row.addWidget(clear_btn)
 
     close_btn = QPushButton("关闭")
-    close_btn.setStyleSheet(_BTN_GHOST)
+    close_btn.setStyleSheet(st["btn_ghost"])
     close_btn.clicked.connect(dialog.accept)
     button_row.addWidget(close_btn)
     button_row.addStretch(1)
@@ -459,10 +490,11 @@ def show_manual_edits_dialog(parent, questions, manual_edits, current_q=None, on
 
 def show_frequency_stats_dialog(parent, questions, records, question_map):
     """展示当前题库的作答统计。"""
+    st = dialog_styles(theme.tokens())
     dialog = QDialog(parent)
     dialog.setWindowTitle("考频统计")
     dialog.resize(980, 620)
-    dialog.setStyleSheet(_DIALOG_BG)
+    dialog.setStyleSheet(st["dialog_bg"])
 
     layout = QVBoxLayout(dialog)
     layout.setContentsMargins(16, 16, 16, 16)
@@ -470,25 +502,21 @@ def show_frequency_stats_dialog(parent, questions, records, question_map):
 
     summary = QLabel()
     summary.setWordWrap(True)
-    summary.setStyleSheet("font-size: 13px; color: #344054;")
+    summary.setStyleSheet(st["summary"])
     layout.addWidget(summary)
 
     control_row = QHBoxLayout()
     sort_combo = QComboBox()
     sort_combo.addItems(["按作答次数", "按错误次数", "按错误率", "按题号"])
-    sort_combo.setStyleSheet(
-        "QComboBox { border: 1px solid #d0d5dd; border-radius: 6px; padding: 5px 10px;"
-        " font-size: 13px; background: white; }"
-        "QComboBox::drop-down { border: none; }"
-    )
+    sort_combo.setStyleSheet(st["combo_small"])
     ctrl_lbl = QLabel("排序方式：")
-    ctrl_lbl.setStyleSheet("font-size: 13px; color: #667085;")
+    ctrl_lbl.setStyleSheet(st["ctrl_label"])
     control_row.addWidget(ctrl_lbl)
     control_row.addWidget(sort_combo)
 
     only_attempted = QCheckBox("仅看已作答题目")
     only_attempted.setChecked(True)
-    only_attempted.setStyleSheet("font-size: 13px; color: #344054;")
+    only_attempted.setStyleSheet(st["checkbox"])
     control_row.addWidget(only_attempted)
     control_row.addStretch(1)
     layout.addLayout(control_row)
@@ -499,11 +527,7 @@ def show_frequency_stats_dialog(parent, questions, records, question_map):
     table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
     table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-    table.setStyleSheet(
-        "QTableWidget { border: 1px solid #e4e7ec; border-radius: 8px; gridline-color: #f2f4f7; }"
-        "QHeaderView::section { background: #f9fafb; color: #667085; font-size: 12px;"
-        " padding: 6px; border: none; border-bottom: 1px solid #e4e7ec; }"
-    )
+    table.setStyleSheet(st["table"])
     layout.addWidget(table, 1)
 
     rows = []
@@ -596,12 +620,12 @@ def show_frequency_stats_dialog(parent, questions, records, question_map):
 
     button_row = QHBoxLayout()
     detail_btn = QPushButton("查看所选题")
-    detail_btn.setStyleSheet(_BTN_GHOST)
+    detail_btn.setStyleSheet(st["btn_ghost"])
     detail_btn.clicked.connect(show_selected_detail)
     button_row.addWidget(detail_btn)
 
     close_btn = QPushButton("关闭")
-    close_btn.setStyleSheet(_BTN_GHOST)
+    close_btn.setStyleSheet(st["btn_ghost"])
     close_btn.clicked.connect(dialog.accept)
     button_row.addWidget(close_btn)
     button_row.addStretch(1)
