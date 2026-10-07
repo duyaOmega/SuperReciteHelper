@@ -1,8 +1,10 @@
 # SuperReciteHelper
 
-一个面向日常复习和考试准备的桌面刷题工具。支持**txt, doc, docx文件格式**导入、**自动识别**题型与答案，并根据你的作答情况进行加权抽题，优先复习薄弱点。
+一个面向日常复习和考试准备的刷题工具（桌面版 + 网页版）。支持**txt, doc, docx文件格式**导入、**自动识别**题型与答案，并根据你的作答情况进行加权抽题，优先复习薄弱点。
 
 当前版本：5.3（2026-10-07）
+
+网页版（Beta）已上线：https://duyaomega.github.io/SuperReciteHelper/ （手机浏览器可直接使用）
 
 录频演示北大网盘链接：https://disk.pku.edu.cn/link/AA83B5FBCDF6C44B9986BE016910421EB3
 
@@ -81,7 +83,7 @@
 
 仓库中的 SuperReciteHelper_v5.3.exe 为可执行版本，双击即可使用（Windows）。
 
-关于Mac和Android等版本，请期待后续开发~
+Mac / Android 用户可先使用「方式三：网页版」；原生 Mac / Android 版本请期待后续开发~
 
 ### 方式二：运行 Python 源码（推荐开发者）
 
@@ -97,6 +99,16 @@ pip install PyQt6 python-docx pywin32
 - pywin32：通过 Word COM 读取 doc（仅 Windows，且本机需安装 Microsoft Word）。
 
 3. 运行程序 `python main.py`
+
+### 方式三：网页版（Beta，手机 / 平板 / 电脑浏览器直接使用）
+
+无需安装，浏览器打开 https://duyaomega.github.io/SuperReciteHelper/ 即可刷题。
+
+- 网页版通过 Pyodide 在浏览器中运行与桌面版相同的核心逻辑（解析、加权抽题、记录统计）
+- 作答记录与主题选择保存在浏览器本地（localStorage），与桌面版互不相通
+- 首次打开需联网下载约 10MB 的 Python 运行时，之后走浏览器缓存
+
+网页版源码位于 `web/` 目录：题库由 `web/tools/build_assets.py` 从 docx 解析生成 `web/data/bank.json`，页面主题 token 由 `src/ui/theme.py` 生成 `web/theme.css`；推送到 main 分支后由 GitHub Actions 自动部署到 GitHub Pages。
 
 ## 3. 实现思路
 
@@ -119,11 +131,22 @@ pip install PyQt6 python-docx pywin32
 - `app_state.json`：最近打开文件等应用状态。
 - `question_edits.json`：手动修改过的题目与答案。
 
+网页版的对应数据保存在浏览器 localStorage（`srh_web_*` 键），与桌面版相互独立。
+
 ### 3.3 图形界面
 - `ui_main.py`: 连接前端与后端 `QuizApp`，控制刷题主界面、题库状态与交互变量
 - `ui_pyqt.py`: 图形界面模块 `QuizWindow`，负责主界面布局、显示题目及下一题、提交答案、调用各类弹窗、键盘输入等功能
 - `ui_pyqt_dialogs.py`: 定义各类 PyQt 弹窗（题目编辑、管理修改、考频统计和题目详情）及界面共用常量
 - `theme.py`: 定义浅色/深色两套主题的颜色 token 与切换逻辑，界面样式统一由 token 生成，不硬编码颜色
+
+### 3.4 网页版（web/）
+
+网页版不重复实现刷题逻辑，而是通过 Pyodide 把 `src/core` 的解析、抽题、记录逻辑原样跑在浏览器里：
+
+- `web/index.html` / `web/app.js` / `web/app.css`：网页界面与交互（对应桌面版 `ui_pyqt.py` 的职责）
+- `web/py/web_glue.py`：JS 与 Python 核心的胶合层，以 JSON 字符串为接口，并把存储重定向到 localStorage
+- `web/data/bank.json`、`web/theme.css`、`web/pycore/*.py`：构建产物，由 `web/tools/build_assets.py`（用法：`python web/tools/build_assets.py [题库文档路径]`）生成，随仓库提交
+- `.github/workflows/pages.yml`：push 到 main 后自动部署到 GitHub Pages
 
 
 ## 4 运行效果图展示
@@ -142,6 +165,7 @@ pip install PyQt6 python-docx pywin32
 后续该项目拓展成为本小组程设大作业，代码框架由 @RavenX2007 完成，UI部分的升级由 @jih484287-wq 完成，后续的维护和拓展由 @GeorgeZhou 完成。
 
 当前版本：5.3（2026-10-07）
+- 网页版（2026-10-07）：新增基于 Pyodide 的网页版并部署至 GitHub Pages，手机浏览器可直接刷题（当前网页版题库固定为一份指定题库，构建期由 docx 解析生成 bank.json）
 - 5.3: 新增深色/浅色模式，主界面右上角一键切换并记住选择（首次运行跟随系统主题）；修复深色系统下统计、编辑等窗口文字不可见的问题
 - 5.2: 由 @GeorgeZhou 主导，将项目代码重新组织，以便于后续维护和开发，并拓展 LLM 解析器接口
 - 5.1：由 @RavenX2007 进行了一些修复和优化

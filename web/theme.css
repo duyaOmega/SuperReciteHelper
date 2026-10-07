@@ -1,0 +1,63 @@
+/* 本文件由 web/tools/build_assets.py 自动生成（token 来源：src/ui/theme.py），请勿手改。 */
+
+:root[data-theme="light"] {
+  --bg: #f9fafb;
+  --surface: #ffffff;
+  --surface-alt: #f2f4f7;
+  --surface-hover: #e4e7ec;
+  --border: #e4e7ec;
+  --input-border: #d0d5dd;
+  --text: #101828;
+  --text-secondary: #344054;
+  --muted: #667085;
+  --faint: #98a2b3;
+  --subtle: #b0b7c3;
+  --primary: #1570ef;
+  --primary-hover: #175cd3;
+  --primary-disabled: #b2ccff;
+  --accent-bg: #eff8ff;
+  --accent-text: #1570ef;
+  --ok-bg: #ecfdf3;
+  --ok-bg-hover: #d1fae5;
+  --ok-border: #6ce9a6;
+  --ok-text: #027a48;
+  --err-bg: #fff1f0;
+  --err-bg-hover: #ffe4e6;
+  --err-border: #fca5a5;
+  --err-text: #b42318;
+  --warn-text: #b54708;
+  --grid: #f2f4f7;
+  --header-bg: #f9fafb;
+  --add-border: #b2ccff;
+}
+
+:root[data-theme="dark"] {
+  --bg: #0e1116;
+  --surface: #171b21;
+  --surface-alt: #1e242c;
+  --surface-hover: #272e38;
+  --border: #262d37;
+  --input-border: #39414d;
+  --text: #e8edf3;
+  --text-secondary: #c6cfda;
+  --muted: #98a2b3;
+  --faint: #7c8794;
+  --subtle: #606a78;
+  --primary: #3b82f6;
+  --primary-hover: #5b97f8;
+  --primary-disabled: #2c466b;
+  --accent-bg: #182741;
+  --accent-text: #7cb0ff;
+  --ok-bg: #10231b;
+  --ok-bg-hover: #173324;
+  --ok-border: #2e6f4e;
+  --ok-text: #63d99b;
+  --err-bg: #291417;
+  --err-bg-hover: #381a1f;
+  --err-border: #7f3d3d;
+  --err-text: #ff9d9d;
+  --warn-text: #eab168;
+  --grid: #222933;
+  --header-bg: #1c222b;
+  --add-border: #33507e;
+}

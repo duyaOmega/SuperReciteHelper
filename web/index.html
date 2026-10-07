@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>SuperReciteHelper 网页版</title>
+<link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<div id="loading" class="loading-overlay">
+  <div class="loading-card">
+    <div class="spinner" aria-hidden="true"></div>
+    <div id="loading-text" class="loading-text">正在加载刷题引擎…</div>
+    <div id="loading-sub" class="loading-sub">首次打开需下载约 10MB 的 Python 运行时，之后会走浏览器缓存。</div>
+    <button id="loading-retry" class="btn btn-ghost" hidden>重试</button>
+  </div>
+</div>
+
+<header class="topbar">
+  <div class="topbar-left">
+    <span class="app-title">SuperReciteHelper</span>
+    <span id="bank-title" class="bank-title"></span>
+  </div>
+  <div class="topbar-right">
+    <span id="stats-bar" class="stats-bar"></span>
+    <button id="theme-btn" class="icon-btn" title="切换深色 / 浅色模式">🌙</button>
+  </div>
+</header>
+
+<main class="content">
+  <section class="card">
+    <div class="q-head">
+      <span id="q-number" class="q-number"></span>
+      <span id="q-type" class="q-type" hidden></span>
+    </div>
+    <div id="welcome" class="welcome"></div>
+    <div id="q-text" class="q-text" hidden></div>
+    <div id="options" class="options"></div>
+    <div id="result" class="result" hidden></div>
+    <div id="history" class="history" hidden></div>
+  </section>
+  <p class="kb-hint">键盘：输入 A/B/C 选择选项，回车提交；主观题显示答案后输入 t/f 自评；已判分后回车进入下一题。</p>
+</main>
+
+<footer class="toolbar">
+  <div class="toolbar-row">
+    <button id="submit-btn" class="btn btn-primary" disabled>提交答案</button>
+    <button id="next-btn" class="btn btn-ok" disabled>下一题 ▶</button>
+  </div>
+  <div class="toolbar-row">
+    <button id="stats-btn" class="btn btn-ghost" disabled>考频统计</button>
+    <button id="reset-btn" class="btn btn-ghost btn-danger" disabled>重置记录</button>
+  </div>
+</footer>
+
+<div id="modal-root"></div>
+<div id="toast-root" class="toast-root"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
